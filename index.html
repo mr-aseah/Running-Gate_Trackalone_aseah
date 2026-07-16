@@ -658,6 +658,7 @@ button.big {
           <button id="btnClearRoster" class="secondary">Clear roster</button>
           <button id="btnSaveRoster" class="secondary">Save roster on this device</button>
           <button id="btnForgetRoster" class="secondary">Forget saved roster</button>
+          <button id="btnDiscardSessionSnapshot" class="secondary">Discard saved session</button>
         </div>
 
         <div class="hintRow small">
@@ -885,6 +886,9 @@ function getMinLapMs() {
 }
 
 const ROSTER_STORAGE_KEY = "runTimingRosterV1";
+const SESSION_STORAGE_KEY = "runTimingSessionV2Stage1";
+const SESSION_STORAGE_SCHEMA_VERSION = 1;
+const SESSION_RECOVERY_MAX_WALL_GAP_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 // ===== Session preset support =====
 const DEFAULT_SESSION = { label: "3 × 800m", reps: 3, repDistanceM: 800 };
@@ -908,8 +912,12 @@ let students = []; // { id, name, tagId }
 
 // ===== State =====
 let session = {
+  sessionId: null,
   started: false,
   startPerf: null,         // performance.now() at start
+  startWallTimeIso: null,  // immutable wall-clock timestamp for session start
+  endedWallTimeIso: null,  // wall-clock timestamp set when the session is ended
+  endedElapsedMs: null,    // elapsed duration captured when the session is ended
   timerHandle: null,
   lastActionStack: [],     // for UNDO
   dataById: new Map(),     // id -> { splits: [ms], lastScanAtPerf }
@@ -972,6 +980,202 @@ function download(filename, text) {
   URL.revokeObjectURL(url);
 }
 
+function makeSessionId() {
+  const stamp = new Date().toISOString().replace(/[^0-9A-Za-z]/g, "");
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `sess_${stamp}_${rand}`;
+}
+
+function serializeSessionDataById() {
+  const out = {};
+  session.dataById.forEach((d, id) => {
+    out[id] = {
+      splits: Array.isArray(d.splits) ? d.splits.slice() : [],
+      lastScanAtPerf: Number.isFinite(d.lastScanAtPerf) ? d.lastScanAtPerf : null,
+    };
+  });
+  return out;
+}
+
+function restoreDataById(savedData) {
+  session.dataById.clear();
+  const byId = savedData && typeof savedData === "object" ? savedData : {};
+  for (const st of students) {
+    const saved = byId[st.id] || {};
+    session.dataById.set(st.id, {
+      splits: Array.isArray(saved.splits) ? saved.splits.slice() : [],
+      lastScanAtPerf: typeof saved.lastScanAtPerf === "number" ? saved.lastScanAtPerf : -Infinity,
+    });
+  }
+}
+
+function buildSessionSnapshot(status) {
+  const elapsedMsAtSave = session.started ? nowElapsedMs() : (Number.isFinite(session.endedElapsedMs) ? session.endedElapsedMs : 0);
+  let finalElapsedMs = elapsedMsAtSave;
+  if (!session.started) {
+    for (const d of session.dataById.values()) {
+      const splits = Array.isArray(d.splits) ? d.splits : [];
+      for (const ms of splits) {
+        if (typeof ms === "number" && Number.isFinite(ms)) finalElapsedMs = Math.max(finalElapsedMs, ms);
+      }
+    }
+  }
+  return {
+    schema: "runTimingSessionV2Stage1",
+    schemaVersion: SESSION_STORAGE_SCHEMA_VERSION,
+    savedAtWallTimeIso: new Date().toISOString(),
+    status: status || (session.started ? "ACTIVE" : "COMPLETED"),
+    session: {
+      sessionId: session.sessionId,
+      started: !!session.started,
+      startWallTimeIso: session.startWallTimeIso,
+      endedWallTimeIso: session.endedWallTimeIso,
+      endedElapsedMs: Number.isFinite(session.endedElapsedMs) ? session.endedElapsedMs : null,
+      elapsedMsAtSave: session.started ? elapsedMsAtSave : finalElapsedMs,
+    },
+    sessionConfig: { ...sessionConfig },
+    students: students.map(s => ({ ...s })),
+    dataById: serializeSessionDataById(),
+    lastActionStack: session.lastActionStack.map(a => ({ ...a })),
+    ui: {
+      elapsedText: elElapsed ? elElapsed.textContent : "",
+      sessionPresetValue: sessionPreset ? sessionPreset.value : "",
+      customRepsValue: customReps ? customReps.value : "",
+      customDistValue: customDist ? customDist.value : "",
+      classCodeValue: document.getElementById("classCode") ? document.getElementById("classCode").value : "",
+    },
+  };
+}
+
+function saveSessionSnapshot(status) {
+  try {
+    if (!session.sessionId && !session.started && session.dataById.size === 0) return;
+    const snapshot = buildSessionSnapshot(status);
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch (e) {
+    pushFeedItem(`<b>Warning</b>: could not save session recovery data.`);
+  }
+}
+
+function getSavedSessionSnapshot() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.schema !== "runTimingSessionV2Stage1" || parsed.schemaVersion !== SESSION_STORAGE_SCHEMA_VERSION) return { corrupted: true };
+    return parsed;
+  } catch (e) {
+    return { corrupted: true };
+  }
+}
+
+function discardSavedSessionSnapshot() {
+  localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
+function calculateRecoveredElapsedMs(snapshot, elapsedMsAtSave) {
+  if (!(snapshot && snapshot.status === "ACTIVE")) return elapsedMsAtSave;
+
+  const savedAtMs = Date.parse(snapshot.savedAtWallTimeIso || "");
+  const wallClockGapMs = Date.now() - savedAtMs;
+  const gapLooksWrong = (
+    !Number.isFinite(savedAtMs) ||
+    !Number.isFinite(wallClockGapMs) ||
+    wallClockGapMs < 0 ||
+    wallClockGapMs > SESSION_RECOVERY_MAX_WALL_GAP_MS
+  );
+
+  if (gapLooksWrong) {
+    const reason = !Number.isFinite(savedAtMs)
+      ? "the saved timestamp is invalid"
+      : (wallClockGapMs < 0
+        ? "the system clock appears to have moved backwards"
+        : "the interruption gap is unusually large");
+    const resumeSaved = window.confirm(
+      `Recovery timing warning: ${reason}.\n\n` +
+      `OK = resume from the saved elapsed time (${fmtTime(elapsedMsAtSave)}) without adding the questionable gap.\n` +
+      "Cancel = leave the saved recovery snapshot untouched."
+    );
+    if (!resumeSaved) throw new Error("Recovery cancelled because saved timing data looked inconsistent.");
+    return elapsedMsAtSave;
+  }
+
+  return elapsedMsAtSave + wallClockGapMs;
+}
+
+function applyRecoveredSessionSnapshot(snapshot) {
+  if (!snapshot || !snapshot.session || !Array.isArray(snapshot.students) || !snapshot.sessionConfig) {
+    throw new Error("Saved session recovery data is incomplete.");
+  }
+  const elapsedMsAtSave = Number(snapshot.session.elapsedMsAtSave);
+  if (!Number.isFinite(elapsedMsAtSave) || elapsedMsAtSave < 0) {
+    throw new Error("Saved session elapsed time is invalid.");
+  }
+  const restoredElapsedMs = calculateRecoveredElapsedMs(snapshot, elapsedMsAtSave);
+
+  students = snapshot.students.map(s => ({ ...s }));
+  sessionConfig = { ...snapshot.sessionConfig };
+  session.sessionId = snapshot.session.sessionId || makeSessionId();
+  session.started = snapshot.status === "ACTIVE" && !!snapshot.session.started;
+  session.startWallTimeIso = snapshot.session.startWallTimeIso || null;
+  session.endedWallTimeIso = snapshot.session.endedWallTimeIso || null;
+  session.endedElapsedMs = Number.isFinite(Number(snapshot.session.endedElapsedMs)) ? Number(snapshot.session.endedElapsedMs) : (session.started ? null : elapsedMsAtSave);
+  session.startPerf = session.started ? (performance.now() - restoredElapsedMs) : null;
+  session.lastActionStack = Array.isArray(snapshot.lastActionStack) ? snapshot.lastActionStack.map(a => ({ ...a })) : [];
+  restoreDataById(snapshot.dataById);
+
+  if (sessionPreset && snapshot.ui && snapshot.ui.sessionPresetValue) sessionPreset.value = snapshot.ui.sessionPresetValue;
+  if (customReps && snapshot.ui && snapshot.ui.customRepsValue) customReps.value = snapshot.ui.customRepsValue;
+  if (customDist && snapshot.ui && snapshot.ui.customDistValue) customDist.value = snapshot.ui.customDistValue;
+  const classCode = document.getElementById("classCode");
+  if (classCode && snapshot.ui && snapshot.ui.classCodeValue) classCode.value = snapshot.ui.classCodeValue;
+
+  paintSessionPanel(sessionConfig.label, sessionConfig.reps, sessionConfig.repDistanceM);
+  updateSessionConfigPreview();
+  lockSessionControls(session.started);
+  btnStart.disabled = session.started;
+  btnStop.disabled = !session.started;
+  btnExport.disabled = session.started;
+  btnUndo.disabled = session.lastActionStack.length === 0;
+  elElapsed.textContent = fmtTime(restoredElapsedMs);
+
+  if (session.timerHandle) window.clearInterval(session.timerHandle);
+  session.timerHandle = null;
+  if (session.started) {
+    session.timerHandle = window.setInterval(() => {
+      elElapsed.textContent = fmtTime(nowElapsedMs());
+    }, 100);
+  }
+
+  renderGrid();
+  renderCounters();
+  pushFeedItem(`<b>Recovered</b>: ${snapshot.status === "ACTIVE" ? "active" : "completed"} session ${sessionConfig.label}`);
+  saveSessionSnapshot(snapshot.status === "ACTIVE" ? "ACTIVE" : "COMPLETED");
+  focusScanInput();
+}
+
+function maybeRecoverSavedSession() {
+  const snapshot = getSavedSessionSnapshot();
+  if (!snapshot) return;
+  if (snapshot.corrupted) {
+    alert("Saved session recovery data could not be read. It has not been deleted; use Discard saved session only after you no longer need it.");
+    return;
+  }
+  const label = snapshot.sessionConfig && snapshot.sessionConfig.label ? snapshot.sessionConfig.label : "saved session";
+  const elapsed = snapshot.session && Number.isFinite(Number(snapshot.session.elapsedMsAtSave)) ? fmtTime(Number(snapshot.session.elapsedMsAtSave)) : "unknown elapsed";
+  const promptLabel = snapshot.status === "ACTIVE" ? "Recover active session" : "Restore completed session snapshot for review/export";
+  const resume = window.confirm(`${promptLabel} "${label}" saved at ${snapshot.savedAtWallTimeIso || "unknown time"} (${elapsed})?\n\nOK = restore it. Cancel = leave saved recovery data untouched.`);
+  if (!resume) {
+    pushFeedItem(`<b>Recovery available</b>: saved session left untouched.`);
+    return;
+  }
+  try {
+    applyRecoveredSessionSnapshot(snapshot);
+  } catch (e) {
+    alert(`Saved session recovery failed: ${e.message || e}. Recovery data was left untouched.`);
+  }
+}
+
 // ===== UI Elements =====
 const elElapsed = document.getElementById("elapsed");
 const elGrid = document.getElementById("grid");
@@ -1029,6 +1233,7 @@ const csvFile = document.getElementById("csvFile");
 const btnClearRoster = document.getElementById("btnClearRoster");
 const btnSaveRoster = document.getElementById("btnSaveRoster");
 const btnForgetRoster = document.getElementById("btnForgetRoster");
+const btnDiscardSessionSnapshot = document.getElementById("btnDiscardSessionSnapshot");
 
 // New (optional) UI elements for presets/custom
 const sessionPreset = document.getElementById("sessionPreset");
@@ -1222,6 +1427,7 @@ if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
   if (minLapMs > 0 && prev != null && (elapsed - prev) < minLapMs) {
     pushFeedItem(`<b>Too soon</b>: ${s.name} (${fmtTime(elapsed - prev)} since last) — ignored`);
     d.lastScanAtPerf = perfNow;
+    saveSessionSnapshot("ACTIVE");
     return;
   }
 
@@ -1241,6 +1447,7 @@ if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
   var srcLabel2 = (source == null || source === "") ? "SCAN" : source;
   pushFeedItem(`<b>${label}</b> — ${s.name} — ${fmtTime(elapsed)} <span style="color:#555">(${srcLabel2})</span>`);
   renderGrid();
+  saveSessionSnapshot("ACTIVE");
 }
 
 function recordPassByTagId(tagId) {
@@ -1257,6 +1464,15 @@ function recordPassByTagId(tagId) {
 
 // ===== Session controls =====
 function startRun() {
+  const existingSnapshot = getSavedSessionSnapshot();
+  if (existingSnapshot && !existingSnapshot.corrupted) {
+    const replace = window.confirm("A recoverable session snapshot already exists. Starting a new session will replace that recovery snapshot but will not delete the saved roster. Continue?");
+    if (!replace) return;
+  } else if (existingSnapshot && existingSnapshot.corrupted) {
+    const replaceCorrupt = window.confirm("A saved session snapshot exists but could not be read. Starting a new session will replace it. Continue?");
+    if (!replaceCorrupt) return;
+  }
+
   if (students.length === 0) {
     alert("Please load a roster CSV first.");
     return;
@@ -1277,8 +1493,12 @@ function startRun() {
   updateSessionConfigPreview();
 
   initSessionData();
+  session.sessionId = makeSessionId();
   session.started = true;
   session.startPerf = performance.now();
+  session.startWallTimeIso = new Date().toISOString();
+  session.endedWallTimeIso = null;
+  session.endedElapsedMs = null;
 
   btnStart.disabled = true;
   btnStop.disabled = false;
@@ -1293,10 +1513,13 @@ function startRun() {
     elElapsed.textContent = fmtTime(nowElapsedMs());
   }, 100);
 
+  saveSessionSnapshot("ACTIVE");
   focusScanInput();
 }
 
 function endRun() {
+  session.endedElapsedMs = nowElapsedMs();
+  session.endedWallTimeIso = new Date().toISOString();
   session.started = false;
   btnStart.disabled = false;
   btnStop.disabled = true;
@@ -1309,6 +1532,7 @@ function endRun() {
   session.timerHandle = null;
 
   pushFeedItem(`<b>Ended</b> — elapsed ${elElapsed.textContent}`);
+  saveSessionSnapshot("COMPLETED");
 }
 
 function undoLast() {
@@ -1326,6 +1550,7 @@ function undoLast() {
   pushFeedItem(`<b>Undo</b> — ${s.name} removed ${fmtTime(action.removedSplit)}`);
   btnUndo.disabled = session.lastActionStack.length === 0;
   renderGrid();
+  saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
 }
 
 function exportCsv() {
@@ -1502,6 +1727,15 @@ btnForgetRoster.addEventListener("click", () => {
   localStorage.removeItem(ROSTER_STORAGE_KEY);
   pushFeedItem(`<b>Saved roster removed</b> from this device`);
 });
+
+if (btnDiscardSessionSnapshot) {
+  btnDiscardSessionSnapshot.addEventListener("click", () => {
+    const ok = window.confirm("Discard saved session recovery data? This does not delete the saved roster.");
+    if (!ok) return;
+    discardSavedSessionSnapshot();
+    pushFeedItem(`<b>Saved session discarded</b> — saved roster was not changed`);
+  });
+}
 
 
 function parseRosterCsv(text) {
@@ -3134,8 +3368,16 @@ if (btnPrintClass) {
   initSessionData();
   renderGrid();
   renderCounters();
+  maybeRecoverSavedSession();
   focusScanInput();
 })();
+
+window.addEventListener("beforeunload", (e) => {
+  if (!session.started) return;
+  saveSessionSnapshot("ACTIVE");
+  e.preventDefault();
+  e.returnValue = "";
+});
 
 
 // ===== Run-to-run compare (Format 2) =====
