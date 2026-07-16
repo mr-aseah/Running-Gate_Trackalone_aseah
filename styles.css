@@ -1,0 +1,504 @@
+:root { font-family: system-ui, Arial, sans-serif; }
+body { margin: 0; background: #f6f7fb; color: #111; }
+
+.topbar {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 16px;
+  background: white;
+  border-bottom: 1px solid #e5e7eb;
+  position: sticky; top: 0;
+}
+
+.timer .label { font-size: 12px; color: #555; }
+.elapsed { font-size: 34px; font-weight: 700; letter-spacing: 0.5px; }
+
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+}
+
+button {
+  padding: 10px 14px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  border-radius: 10px;
+  cursor: pointer;
+  font-weight: 700;
+}
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.secondary { font-weight: 700; }
+
+.counters { display: flex; gap: 14px; justify-content: flex-end; flex-wrap: wrap; }
+.k { color: #555; font-size: 12px; margin-right: 6px; }
+.v { font-weight: 900; }
+
+.layout {
+  display: grid;
+  grid-template-columns: 3fr 1fr;
+  gap: 12px;
+  padding: 12px 16px;
+}
+
+.hint {
+  padding: 10px;
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  display: grid;
+  gap: 8px;
+}
+.hintRow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.hintRow.small { font-size: 12px; color: #444; }
+.fileLabel { display: flex; gap: 8px; align-items: center; font-weight: 800; }
+.warn { margin-left: 10px; color: #b45309; font-weight: 900; }
+
+.grid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.tile {
+  background: white;
+  border: 2px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 10px;
+  cursor: pointer;
+  user-select: none;
+  min-height: 92px;
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  gap: 6px;
+}
+.tile .name { font-weight: 900; font-size: 16px; }
+.tile .meta { font-size: 12px; color: #555; display: flex; justify-content: space-between; }
+.tile .times { white-space: pre-line; font-variant-numeric: tabular-nums; font-size: 12px; color: #111; }
+
+.state0 { border-color: #e5e7eb; }
+.state1 { border-color: #3b82f6; background: #eff6ff; } /* in progress */
+.state2 { border-color: #ef4444; background: #fef2f2; } /* final rep warning */
+.state3 { border-color: #10b981; background: #ecfdf5; } /* finished */
+
+/* Extra colour step for 4-rep sessions (e.g., 4×600m) */
+.tile.stage4_1 { border-color: #3b82f6; background: #eff6ff; } /* blue */
+
+/* More specific: only override when state1 + stage4_2 */
+.tile.state1.stage4_2 { border-color: #a855f7; background: #faf5ff; } /* purple */
+
+.sidebar .panel {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 10px;
+  margin-bottom: 12px;
+}
+.panelTitle { font-weight: 900; margin-bottom: 8px; }
+.panelBody { font-size: 12px; }
+.feed { display: grid; gap: 8px; }
+.feedItem { border: 1px solid #eee; border-radius: 10px; padding: 8px; font-size: 12px; }
+.feedItem b { font-size: 13px; }
+
+.scanInput {
+  position: fixed;
+  left: -9999px;
+  top: -9999px;
+  opacity: 0;
+}
+
+/* Session preset controls */
+.session-controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.session-controls select,
+.session-controls input[type="number"] {
+  padding: 8px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #fff;
+  font-weight: 700;
+  font-family: inherit;
+}
+
+.session-controls label {
+  font-weight: 900;
+}
+
+#sessionSummary {
+  color: #334155;
+  font-weight: 800;
+}
+
+/* ===== Analytics Modal ===== */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.35);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  z-index: 999;
+}
+
+.modalCard {
+  width: min(980px, 96vw);
+  background: #fff;
+  border-radius: 14px;
+  border: 1px solid #e5e7eb;
+  box-shadow: 0 18px 40px rgba(0,0,0,0.18);
+  overflow: hidden;
+}
+.modalCard { max-height: 90vh; overflow: auto; }
+
+.modalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.modalTitle { font-weight: 900; }
+
+.modalBody { padding: 12px 14px; display: grid; gap: 10px; }
+.modalBody { overflow: auto; }
+
+.modalBody .row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.modal select { min-width: 220px; padding: 8px 10px; border-radius: 10px; }
+.chart { max-width: 100%; height: auto; }
+
+.hidden { display: none !important; }
+
+.summaryBox {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 10px;
+  background: #f8fafc;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.chart {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  background: #fff;
+}
+
+/* ===== Analytics: Class View table ===== */
+.tableWrap {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  overflow: auto;
+  max-height: 320px;
+  background: #fff;
+}
+
+.classTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.classTable th, .classTable td {
+  border-bottom: 1px solid #eef2f7;
+  padding: 8px 10px;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.classTable th {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  z-index: 1;
+  text-align: left;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #f8fafc;
+  font-weight: 800;
+}
+
+/* ===== Student Report block (Analytics modal) ===== */
+.studentReport {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 12px;
+  background: #fff;
+}
+
+.reportHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.reportName { font-size: 16px; font-weight: 900; }
+.reportSession { font-size: 12px; color: #475569; font-weight: 800; }
+
+.reportMetrics {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.reflectionBox {
+  margin-top: 10px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  padding: 10px;
+  background: #f8fafc;
+}
+
+.rbTitle { font-weight: 900; margin-bottom: 6px; }
+.rbGrid { display: grid; gap: 6px; font-size: 13px; }
+
+.reportFooter {
+  margin-top: 10px;
+  font-size: 11px;
+  color: #64748b;
+  font-weight: 700;
+}
+
+/* ===== Print only the student report ===== */
+@media print {
+  body * { visibility: hidden; }
+  #studentReport, #studentReport * { visibility: visible; }
+  #studentReport {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    border: none;
+    border-radius: 0;
+  }
+  .modalHeader, .row, .tableWrap { display: none !important; }
+}
+
+/* Force print to preserve colours (Chrome/Edge) */
+@media print {
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}
+
+/* =========================
+   RunSplit - Pair Mode UI
+   ========================= */
+
+.mode-controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.mode-controls select,
+.mode-controls input {
+  min-width: 180px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid #e5e7eb;
+}
+
+.pairPanel {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
+  padding: 14px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+
+.pairHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.pairTitle {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.pairSub {
+  font-size: 13px;
+  opacity: 0.85;
+  margin-top: 2px;
+}
+
+.pairMeta {
+  font-size: 13px;
+  opacity: 0.85;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.pairSetup {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 10px 0 12px;
+}
+
+.pairSetup input {
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid #e5e7eb;
+}
+
+.pairButtons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  align-items: stretch;
+}
+
+.pairButtonCol {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+button.big {
+  padding: 18px 12px;
+  border-radius: 16px;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.pairSplits {
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 10px 12px;
+  min-height: 48px;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.pairLive {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: #f1f5f9;
+  border: 1px solid #e5e7eb;
+  font-size: 13px;
+}
+
+.pairCards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.pairCard {
+  border: 1px solid #e5e7eb;
+  border-radius: 16px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.pairCardTitle {
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.pairLabel {
+  display: inline-block;
+  font-size: 13px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #e0f2fe;
+  margin-bottom: 6px;
+}
+
+.pairStats {
+  font-size: 13px;
+  line-height: 1.45;
+  margin-top: 8px;
+}
+
+.pairEmail {
+  display: block;
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.pairEmail input {
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid #e5e7eb;
+}
+
+.pairSendMsg {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.pairNote {
+  margin-top: 10px;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+@media (max-width: 980px) {
+  .pairSetup, .pairCards {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+/* ===== Run-to-run compare (Format 2) ===== */
+.sectionDivider { height: 1px; background: #e5e7eb; margin: 14px 0; }
+.compareBox .sectionTitle { font-weight: 800; color: #1f2937; margin-bottom: 8px; }
+.summaryBox.small { font-size: 12px; }
+.compareBox .row { flex-wrap: wrap; }
+
+
+/* Analytics controls */
+#analyticsAge { min-width: 64px; }
+
+#bandingMode { min-width: 140px; }
+
+/* Compare student picker */
+#compareStudentSelect { padding: 8px 10px; border-radius: 10px; border: 1px solid #cbd5e1; }
+
+/* Small filter buttons */
+.secondary.small { padding: 6px 10px; font-size: 12px; border-radius: 999px; }
+.secondary.small.active { border-color: #0B5394; color: #0B5394; background: #E8F0FE; font-weight: 800; }
