@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Pace Coach</title>
+  <link rel="stylesheet" href="merged_pacecoach.css?v=merged_20260402b" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="timer">
+      <div class="label">Elapsed</div>
+      <div id="elapsed" class="elapsed">00:00.0</div>
+    </div>
+
+<div class="controls">
+  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+    <button id="btnStart">Start</button>
+    <button id="btnStop" disabled>End Run</button>
+    <button id="btnUndo" disabled>Undo</button>
+    <button id="btnExport" disabled>Export CSV</button>
+    <button id="btnAnalytics" class="secondary">Analytics</button>
+  </div>
+
+  <!-- Mode + Class code (for Pair Mode sends) -->
+  <div class="mode-controls">
+    <label for="modeSelect"><b>Mode:</b></label>
+    <select id="modeSelect">
+      <option value="class" selected>Class (Scan Gate)</option>
+      <option value="pair">Pair (2 runners)</option>
+    </select>
+
+    <label for="classCode"><b>Class:</b></label>
+    <input id="classCode" type="text" placeholder="e.g. 4F04" maxlength="8" />
+  </div>
+
+  <!-- Session preset controls -->
+  <div class="session-controls"> 
+    <label for="sessionPreset"><b>Session:</b></label>
+    <select id="sessionPreset">
+      <option value="3x800" selected>3 × 800m (2.4km)</option>
+      <option value="6x200">6 × 200m (1.2km)</option>
+      <option value="8x200">8 × 200m (1.6km)</option>
+      <option value="4x600">4 × 600m (2.4km)</option>
+      <option value="custom">Custom…</option>
+    </select>
+
+    <span id="customFields" style="display:none; gap:8px; align-items:center;">
+      <label for="customReps">Reps:</label>
+      <input id="customReps" type="number" min="1" max="30" value="3" style="width:70px;">
+      <label for="customDist">Distance (m):</label>
+      <input id="customDist" type="number" min="50" max="5000" value="600" style="width:90px;">
+    </span>
+
+    <span id="sessionSummary" style="font-size:0.95em; opacity:0.9;"></span>
+  </div>
+</div>
+
+<div class="counters">
+  <div><span class="k">Not started</span> <span id="c0" class="v">0</span></div>
+  <div><span class="k">In progress</span> <span id="c1" class="v">0</span></div>
+  <div><span class="k">Final rep</span> <span id="c2" class="v">0</span></div>
+  <div><span class="k">Finished</span> <span id="c3" class="v">0</span></div>
+</div>
+  </header>
+
+  <!-- Hidden scan capture: keep focus here -->
+  <input id="scanInput" class="scanInput" autocomplete="off" inputmode="none" />
+
+  <main class="layout">
+    <section class="board">
+
+
+      <!-- Pair Mode panel (2 runners, 2 timekeepers) -->
+      <div id="pairPanel" class="pairPanel hidden">
+        <div class="pairHeader">
+          <div>
+            <div class="pairTitle">Pair Mode</div>
+            <div class="pairSub">Press Split A / Split B each time the runner crosses the 200m mark.</div>
+          </div>
+          <div class="pairMeta" id="pairMeta">—</div>
+        </div>
+
+        <div class="pairSetup">
+          <label>Runner A name
+            <input id="pairNameA" type="text" placeholder="Runner A" />
+          </label>
+          <label>Runner B name
+            <input id="pairNameB" type="text" placeholder="Runner B" />
+          </label>
+        </div>
+
+        <div class="pairButtons">
+          <div class="pairButtonCol">
+            <button id="btnSplitA" class="big" disabled>Split A</button>
+            <div id="pairSplitsA" class="pairSplits">—</div>
+          </div>
+          <div class="pairButtonCol">
+            <button id="btnSplitB" class="big" disabled>Split B</button>
+            <div id="pairSplitsB" class="pairSplits">—</div>
+          </div>
+        </div>
+
+        <div id="pairLive" class="pairLive">Switch to <b>Pair Mode</b>, set the session, then press <b>Start</b>.</div>
+
+        <div id="pairResults" class="pairResults hidden">
+          <div class="pairCards">
+            <div class="pairCard">
+              <div class="pairCardTitle">Runner A</div>
+              <div id="pairLabelA" class="pairLabel">—</div>
+              <canvas id="pairChartA" width="520" height="220" class="chart"></canvas>
+              <div id="pairStatsA" class="pairStats">—</div>
+
+              <label class="pairEmail">Email (Runner A)
+                <input id="pairEmailA" type="email" placeholder="name@students.edu.sg" />
+              </label>
+              <button id="btnSendA" class="secondary">Send Runner A stats</button>
+              <div id="pairSendMsgA" class="pairSendMsg"></div>
+            </div>
+
+            <div class="pairCard">
+              <div class="pairCardTitle">Runner B</div>
+              <div id="pairLabelB" class="pairLabel">—</div>
+              <canvas id="pairChartB" width="520" height="220" class="chart"></canvas>
+              <div id="pairStatsB" class="pairStats">—</div>
+
+              <label class="pairEmail">Email (Runner B)
+                <input id="pairEmailB" type="email" placeholder="name@students.edu.sg" />
+              </label>
+              <button id="btnSendB" class="secondary">Send Runner B stats</button>
+              <div id="pairSendMsgB" class="pairSendMsg"></div>
+            </div>
+          </div>
+
+          <div class="pairNote">
+            Students only receive their own results. Teacher views the whole class in the class Google Sheet.
+          </div>
+        </div>
+      </div>
+
+      <div id="scanHint" class="hint">
+        <div class="hintRow">
+          <b>Scan Gate Mode:</b> scan/tag → ID + Enter. (Or tap a tile as fallback.)
+          <span id="focusWarn" class="warn hidden">Click anywhere to refocus scanning.</span>
+        </div>
+
+        <div class="hintRow rosterRow">
+          <label class="fileLabel">
+            Load roster CSV:
+            <input type="file" id="csvFile" accept=".csv" />
+          </label>
+          <button id="btnClearRoster" class="secondary">Clear roster</button>
+          <button id="btnSaveRoster" class="secondary">Save roster on this device</button>
+          <button id="btnForgetRoster" class="secondary">Forget saved roster</button>
+        </div>
+
+        <div class="hintRow small">
+          CSV headers must be: <code>tagId,name</code> (optional: <code>gender,age_group,email</code>)
+        </div>
+      </div>
+
+      <div id="grid" class="grid"></div>
+    </section>
+
+    <aside id="sidebar" class="sidebar">
+      <div class="panel">
+        <div class="panelTitle">Last scans</div>
+        <div id="feed" class="feed"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panelTitle">Session</div>
+<div class="panelBody">
+  <div><span class="k">Session:</span> <span id="sessionLabel">3 × 800m</span></div>
+  <div><span class="k">Reps:</span> <span id="sessionReps">3</span></div>
+  <div><span class="k">Rep distance:</span> <span id="sessionDist">800</span>m</div>
+  <div><span class="k">Total:</span> <span id="sessionTotal">2400</span>m</div>
+  <div><span class="k">Anti-double:</span> 1200ms</div>
+  <div><span class="k">Roster loaded:</span> <span id="rosterCount">0</span></div>
+</div>
+      </div>
+    </aside>
+  </main>
+
+<!-- Analytics Modal -->
+<div id="analyticsModal" class="modal hidden">
+  <div class="modalCard">
+    <div class="modalHeader">
+      <div class="modalTitle">Run Analytics</div>
+      <button id="btnCloseAnalytics" class="secondary">Close</button>
+    </div>
+
+    <div class="modalBody">
+      <!-- Row 1: Upload + Student -->
+      <div class="row">
+        <label class="fileLabel">
+          Upload run CSV:
+          <input type="file" id="analyticsFile" accept=".csv" />
+        </label>
+
+        <label style="display:flex; gap:8px; align-items:center;">
+          Student:
+          <select id="analyticsStudent">
+            <option value="">—</option>
+          </select>
+        </label>
+
+        <label style="display:flex; gap:8px; align-items:center;">
+          Age:
+          <select id="analyticsAge">
+            <option value="14">14</option>
+            <option value="16" selected>16</option>
+          </select>
+        </label>
+
+        <button id="btnExportAnalytics" class="secondary" disabled>Export Analytics CSV</button>
+        <button id="btnPrintStudent" class="secondary" disabled>Download Student Report (PDF)</button>
+        <button id="btnPrintClass" class="secondary" disabled>Download Class Report (PDF)</button>
+      </div>
+
+      <!-- Row 2: Class view controls -->
+      <div class="row">
+        <label style="display:flex; gap:8px; align-items:center;">
+          <input type="checkbox" id="onlyFinished" checked />
+          Finished only
+        </label>
+
+        <label style="display:flex; gap:8px; align-items:center;">
+          Banding:
+          <select id="bandingMode">
+            <option value="both" selected>Both</option>
+            <option value="training">Training only</option>
+            <option value="napfa">NAPFA only</option>
+          </select>
+        </label>
+
+        <span id="classCount" style="font-size:12px; color:#475569;"></span>
+      </div>
+
+
+      <!-- Email (Apps Script) -->
+      <div class="emailBox">
+        <div class="emailTitle">Email reports (Apps Script)</div>
+        <div class="emailRow">
+          <label class="emailField">
+            Apps Script URL
+            <input id="scriptUrl" type="url" placeholder="Paste your deployed Web App URL" />
+          </label>
+          <label class="emailField">
+            Teacher note (optional)
+            <input id="teacherNote" type="text" placeholder="1 short tip for this session…" />
+          </label>
+        </div>
+        <div class="emailRow">
+          <button id="btnSendStudentEmail" class="secondary" disabled>Send selected student</button>
+          <button id="btnSendClassEmails" class="secondary" disabled>Send class (Finished only)</button>
+          <span id="emailStatus" class="emailStatus"></span>
+        </div>
+        <div class="emailHint small">
+          Tip: include an <code>email</code> column in your run CSV (or you will be prompted).
+        </div>
+      </div>
+
+      <!-- Class table -->
+      <div class="tableWrap">
+        <table id="classTable" class="classTable"></table>
+      </div>
+
+
+      <!-- Run-to-run comparison (Format 2) -->
+      <div class="sectionDivider"></div>
+      <div class="compareBox">
+        <div class="emailTitle">Run-to-run comparison (Format 2)</div>
+        <div class="row">
+          <label class="fileLabel">
+            Baseline CSV (S01):
+            <input type="file" id="compareFileA" accept=".csv" />
+          </label>
+
+          <label class="fileLabel">
+            Current CSV (S02):
+            <input type="file" id="compareFileB" accept=".csv" />
+          </label>
+
+          <button id="btnCompareBuild" class="secondary" disabled>Build compare</button>
+          <label style="display:flex; gap:8px; align-items:center;">
+            <input type="checkbox" id="compareFinishedBothOnly" checked />
+            Finished both only
+          </label>
+          <button id="btnCompareExportCsv" class="secondary" disabled>Export Run-to-Run CSV</button>
+          <button id="btnCompareExportJson" class="secondary" disabled>Export Student Summary JSON</button>
+          <button id="btnCompareCopyJson" class="secondary" disabled>Copy JSON</button>
+          <button id="btnComparePreviewJson" class="secondary" disabled>Preview JSON</button>
+          <button id="btnComparePrint" class="secondary" disabled>Download Teacher Compare (PDF)</button>
+          <button id="btnCompareStudentPdf" class="secondary" disabled>Download Student Feedback (PDF)</button>
+        </div>
+
+        <div id="compareSummary" class="summaryBox small">
+          Upload two session CSVs (S01 baseline + S02 current) to compare progress.
+        </div>
+
+        <div class="row" style="margin-top:10px; flex-wrap:wrap;">
+          <div class="row" style="gap:10px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+            <span style="font-weight:700;">Quick filters:</span>
+            <button id="btnFilterAll" class="secondary small active" disabled>All</button>
+            <button id="btnFilterBuild" class="secondary small" disabled>Build</button>
+            <button id="btnFilterCore" class="secondary small" disabled>Core</button>
+            <button id="btnFilterLead" class="secondary small" disabled>Lead</button>
+          </div>
+
+          <label class="fileLabel">
+            Student:
+            <select id="compareStudentSelect" style="min-width:220px;" disabled>
+              <option value="">— Select —</option>
+            </select>
+          </label>
+
+          <button id="btnCompareCopyStudentJson" class="secondary" disabled>Copy Selected JSON</button>
+          <button id="btnComparePreviewStudentJson" class="secondary" disabled>Preview Selected JSON</button>
+          <button id="btnCompareStudentPdfOne" class="secondary" disabled>Download Selected Student PDF</button>
+        </div>
+      </div>
+
+      <!-- Student report (this is what prints) -->
+      <div id="studentReport" class="studentReport">
+        <div class="reportHeader">
+          <div>
+            <div id="reportStudentName" class="reportName">Select a student</div>
+            <div id="reportSessionLine" class="reportSession">—</div>
+          </div>
+
+          <div class="reportMetrics">
+            <div><span class="k">Pace gap</span> <span id="reportPaceGap" class="v">—</span></div>
+            <div><span class="k">Fade</span> <span id="reportFade" class="v">—</span></div>
+            <div><span class="k">Total</span> <span id="reportTotal" class="v">—</span></div>
+            <div><span class="k">Group</span> <span id="reportGroup" class="v">—</span></div>
+          </div>
+        </div>
+
+        <div id="analyticsSummary" class="summaryBox">Upload a CSV to begin.</div>
+
+        <canvas id="splitChart" width="900" height="260" class="chart"></canvas>
+
+        <div class="reflectionBox">
+          <div class="rbTitle">Reflection (Glow • Growth • Next Goal)</div>
+          <div class="rbGrid">
+            <div><b>Glow:</b> <span id="reportGlow">—</span></div>
+            <div><b>Growth:</b> <span id="reportGrowth">—</span></div>
+            <div><b>Next goal:</b> <span id="reportNextGoal">—</span></div>
+          </div>
+        </div>
+
+        <div class="reportFooter">
+          Private report for learning & training. Do not share others’ data.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+  <script src="merged_pacecoach.js?v=merged_20260402b" defer></script>
+</body>
+</html>
