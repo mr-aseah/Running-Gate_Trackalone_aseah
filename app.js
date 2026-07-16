@@ -1,0 +1,2853 @@
+// ===== Config =====
+// Debounce: ignore repeated scans on the same student within this window.
+// (Useful for hands-free/continuous scanners that may re-read the same card.)
+const ANTI_DOUBLE_MS = 2000; // was 1200
+
+// Minimum time between *laps* for the same student.
+// This is a sanity filter to block accidental re-reads when a card lingers in the scan zone.
+// Set dynamically based on the selected rep distance (e.g., 600m test vs 200m training).
+function getMinLapMs() {
+  const dist = sessionConfig && sessionConfig.repDistanceM ? Number(sessionConfig.repDistanceM) : 0;
+
+  // Tune these as needed after a real lesson.
+  if (dist >= 600) return 60000; // 600m loops (test): block anything under 60s
+  if (dist >= 400) return 45000; // 400m loops
+  if (dist >= 300) return 30000; // 300m loops
+  if (dist >= 200) return 20000; // 200m loops (training): block anything under 20s
+  return 15000;                  // default for shorter drills
+}
+
+const ROSTER_STORAGE_KEY = "runTimingRosterV1";
+
+// ===== Session preset support =====
+const DEFAULT_SESSION = { label: "3 × 800m", reps: 3, repDistanceM: 800 };
+let sessionConfig = { ...DEFAULT_SESSION };
+
+function clampInt(n, min, max, fallback) {
+  const x = parseInt(n, 10);
+  if (Number.isNaN(x)) return fallback;
+  return Math.max(min, Math.min(max, x));
+}
+
+function getPresetConfig(value) {
+  if (value === "3x800") return { label: "3 × 800m", reps: 3, repDistanceM: 800 };
+  if (value === "8x200") return { label: "8 × 200m", reps: 8, repDistanceM: 200 };
+  if (value === "4x600") return { label: "4 × 600m", reps: 4, repDistanceM: 600 };
+  return { ...DEFAULT_SESSION };
+}
+
+// ===== Roster (loaded from CSV) =====
+let students = []; // { id, name, tagId }
+
+// ===== State =====
+let session = {
+  started: false,
+  startPerf: null,         // performance.now() at start
+  timerHandle: null,
+  lastActionStack: [],     // for UNDO
+  dataById: new Map(),     // id -> { splits: [ms], lastScanAtPerf }
+};
+
+function initSessionData() {
+  session.dataById.clear();
+  for (const s of students) {
+    session.dataById.set(s.id, {
+      splits: [],
+      lastScanAtPerf: -Infinity,
+    });
+  }
+  session.lastActionStack = [];
+}
+
+// ===== Utilities =====
+function nowElapsedMs() {
+  if (!session.started) return 0;
+  return Math.max(0, performance.now() - session.startPerf);
+}
+
+function fmtTime2(ms) {
+  // MM:SS.xx (centiseconds)
+  const totalCentis = Math.floor(ms / 10);
+  const centis = totalCentis % 100;
+  const totalSeconds = Math.floor(totalCentis / 100);
+  const seconds = totalSeconds % 60;
+  const minutes = Math.floor(totalSeconds / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(centis).padStart(2, "0")}`;
+}
+
+function fmtTime(ms) {
+  // MM:SS.t (tenths) — good for live timer + quick glance
+  const totalTenths = Math.floor(ms / 100);
+  const tenths = totalTenths % 10;
+  const totalSeconds = Math.floor(totalTenths / 10);
+  const seconds = totalSeconds % 60;
+  const minutes = Math.floor(totalSeconds / 60);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${tenths}`;
+}
+
+function makeCsv(rows) {
+  const esc = (v) => {
+    const s = String(v == null ? "" : v);
+    return /[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
+  };
+  return rows.map(r => r.map(esc).join(",")).join("\n");
+}
+
+function download(filename, text) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ===== UI Elements =====
+const elElapsed = document.getElementById("elapsed");
+const elGrid = document.getElementById("grid");
+const elFeed = document.getElementById("feed");
+const elScanInput = document.getElementById("scanInput");
+const elFocusWarn = document.getElementById("focusWarn");
+const elRosterCount = document.getElementById("rosterCount");
+
+const btnStart = document.getElementById("btnStart");
+const btnStop = document.getElementById("btnStop");
+const btnUndo = document.getElementById("btnUndo");
+const btnExport = document.getElementById("btnExport");
+
+// ===== Analytics UI =====
+const btnExportAnalytics = document.getElementById("btnExportAnalytics");
+const btnAnalytics = document.getElementById("btnAnalytics");
+const btnPrintStudent = document.getElementById("btnPrintStudent");
+const btnPrintClass = document.getElementById("btnPrintClass");
+
+const reportStudentName = document.getElementById("reportStudentName");
+const reportSessionLine = document.getElementById("reportSessionLine");
+const reportPaceGap = document.getElementById("reportPaceGap");
+const reportFade = document.getElementById("reportFade");
+const reportTotal = document.getElementById("reportTotal");
+const reportGroup = document.getElementById("reportGroup");
+const reportGlow = document.getElementById("reportGlow");
+const reportGrowth = document.getElementById("reportGrowth");
+const reportNextGoal = document.getElementById("reportNextGoal");
+
+const classTable = document.getElementById("classTable");
+const onlyFinished = document.getElementById("onlyFinished");
+const classCount = document.getElementById("classCount");
+const analyticsModal = document.getElementById("analyticsModal");
+const btnCloseAnalytics = document.getElementById("btnCloseAnalytics");
+const analyticsFile = document.getElementById("analyticsFile");
+const analyticsStudent = document.getElementById("analyticsStudent");
+const analyticsAge = document.getElementById("analyticsAge");
+const bandingMode = document.getElementById("bandingMode");
+const analyticsSummary = document.getElementById("analyticsSummary");
+const splitChart = document.getElementById("splitChart");
+
+// ===== Email (Apps Script Web App) UI =====
+const scriptUrlInput = document.getElementById("scriptUrl");
+const teacherNoteInput = document.getElementById("teacherNote");
+const btnSendStudentEmail = document.getElementById("btnSendStudentEmail");
+const btnSendClassEmails = document.getElementById("btnSendClassEmails");
+const emailStatus = document.getElementById("emailStatus");
+
+const c0 = document.getElementById("c0");
+const c1 = document.getElementById("c1");
+const c2 = document.getElementById("c2");
+const c3 = document.getElementById("c3");
+
+const csvFile = document.getElementById("csvFile");
+const btnClearRoster = document.getElementById("btnClearRoster");
+const btnSaveRoster = document.getElementById("btnSaveRoster");
+const btnForgetRoster = document.getElementById("btnForgetRoster");
+
+// New (optional) UI elements for presets/custom
+const sessionPreset = document.getElementById("sessionPreset");
+const customFields = document.getElementById("customFields");
+const customReps = document.getElementById("customReps");
+const customDist = document.getElementById("customDist");
+const sessionSummary = document.getElementById("sessionSummary");
+const sessionLabelEl = document.getElementById("sessionLabel");
+const sessionRepsEl  = document.getElementById("sessionReps");
+const sessionDistEl  = document.getElementById("sessionDist");
+const sessionTotalEl = document.getElementById("sessionTotal");
+
+function paintSessionPanel(label, reps, dist) {
+  if (sessionLabelEl) sessionLabelEl.textContent = label;
+  if (sessionRepsEl)  sessionRepsEl.textContent = reps;
+  if (sessionDistEl)  sessionDistEl.textContent = dist;
+  if (sessionTotalEl) sessionTotalEl.textContent = reps * dist;
+}
+
+function getTargetPasses() {
+  return clampInt(sessionConfig.reps, 1, 30, 3);
+}
+
+function updateSessionConfigPreview() {
+  // If the HTML controls aren't present, do nothing (keeps app backwards-compatible)
+  if (!sessionPreset || !sessionSummary) return;
+
+  if (sessionPreset.value === "custom") {
+    if (customFields) customFields.style.display = "inline-flex";
+    const reps = clampInt(customReps && customReps.value, 1, 30, 3);
+    const dist = clampInt(customDist && customDist.value, 50, 5000, 600);
+    sessionSummary.textContent = `Selected: ${reps} × ${dist}m (Total ${reps * dist}m)`;
+    paintSessionPanel(`${reps} × ${dist}m`, reps, dist);
+
+  } else {
+    if (customFields) customFields.style.display = "none";
+    const cfg = getPresetConfig(sessionPreset.value);
+    sessionSummary.textContent = `Selected: ${cfg.label} (Total ${cfg.reps * cfg.repDistanceM}m)`;
+    paintSessionPanel(cfg.label, cfg.reps, cfg.repDistanceM);
+
+  }
+}
+
+function lockSessionControls(lock) {
+  if (sessionPreset) sessionPreset.disabled = lock;
+  if (customReps) customReps.disabled = lock;
+  if (customDist) customDist.disabled = lock;
+}
+
+// ===== Rendering =====
+// Map progress into 4 visual states using your existing CSS:
+// state0 = 0 reps
+// state1 = in progress (not final rep)
+// state2 = final rep warning (red)
+// state3 = finished
+function studentStateIndex(sid) {
+  const d = session.dataById.get(sid);
+  const n = (d && d.splits) ? d.splits.length : 0;
+  const target = getTargetPasses();
+
+  if (n <= 0) return 0;
+  if (n >= target) return 3;
+  if (n === target - 1) return 2;
+  return 1;
+}
+
+function renderCounters() {
+  let n0 = 0, n1 = 0, n2 = 0, n3 = 0;
+  for (const s of students) {
+    const st = studentStateIndex(s.id);
+    if (st === 0) n0++;
+    else if (st === 1) n1++;
+    else if (st === 2) n2++;
+    else n3++;
+  }
+  c0.textContent = n0;
+  c1.textContent = n1;
+  c2.textContent = n2;
+  c3.textContent = n3;
+}
+
+function renderGrid() {
+  elGrid.innerHTML = "";
+
+  if (students.length === 0) {
+    const empty = document.createElement("div");
+    empty.style.padding = "14px";
+    empty.style.color = "#444";
+    empty.textContent = "No roster loaded yet. Upload a CSV to begin.";
+    elGrid.appendChild(empty);
+    renderCounters();
+    elRosterCount.textContent = "0";
+    return;
+  }
+
+  const target = getTargetPasses();
+
+  for (const s of students) {
+    const d = session.dataById.get(s.id);
+    const state = studentStateIndex(s.id);
+    const progress = (d && d.splits) ? d.splits.length : 0;
+
+const tile = document.createElement("div");
+tile.className = `tile state${state}`;
+
+// Special colour coding for 4-rep sessions (e.g., 4×600m)
+if (target === 4) {
+  if (progress === 1) tile.classList.add("stage4_1");
+  else if (progress === 2) tile.classList.add("stage4_2");
+}
+
+tile.dataset.sid = s.id;
+
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = s.name;
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const left = document.createElement("span");
+    left.textContent = `${Math.min(progress, target)}/${target}`;
+    const right = document.createElement("span");
+    right.textContent = s.tagId;
+    meta.append(left, right);
+
+    const times = document.createElement("div");
+    times.className = "times";
+
+    const splits = (d && d.splits) ? d.splits : [];
+    const lines = [];
+
+    // Build lines for each recorded pass
+    for (let i = 0; i < splits.length; i++) {
+      const ti = splits[i];
+      const seg = (i === 0) ? ti : (ti - splits[i - 1]);
+      const tag = (i + 1 === target) ? "FINISH" : `t${i + 1}`;
+      lines.push(`${tag} ${fmtTime(ti)} | Rep${i + 1} ${fmtTime(seg)}`);
+    }
+
+    // Keep tile readable for 8×200: show first 2 + last 2 if long
+    let displayLines = lines;
+    if (lines.length > 4) {
+      displayLines = [...lines.slice(0, 2), "…", ...lines.slice(-2)];
+    }
+
+    times.textContent = displayLines.length ? displayLines.join("\n") : "—";
+
+    tile.append(name, meta, times);
+    tile.addEventListener("click", () => recordPassByStudentId(s.id, { source: "TAP" }));
+    elGrid.appendChild(tile);
+  }
+
+  elRosterCount.textContent = String(students.length);
+  renderCounters();
+}
+
+function pushFeedItem(msg) {
+  const item = document.createElement("div");
+  item.className = "feedItem";
+  item.innerHTML = msg;
+  elFeed.prepend(item);
+  while (elFeed.children.length > 10) elFeed.removeChild(elFeed.lastChild);
+}
+
+// ===== Core logic =====
+function recordPassByStudentId(studentId, { source, rawTagId } = {}) {
+  if (!session.started) return;
+
+  const target = getTargetPasses();
+
+  const s = students.find(x => x.id === studentId);
+  const d = session.dataById.get(studentId);
+  if (!s || !d) return;
+
+  if (d.splits.length >= target) {
+    pushFeedItem(`<b>Ignored</b>: ${s.name} already finished.`);
+    return;
+  }
+
+const perfNow = performance.now();
+if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
+  const srcLabel = (source == null || source === "") ? "input" : source;
+  pushFeedItem(`<b>Ignored</b>: ${s.name} (double ${srcLabel})`);
+  return;
+}
+
+  const elapsed = nowElapsedMs();
+
+  const prev = d.splits[d.splits.length - 1];
+  const minLapMs = getMinLapMs();
+  if (minLapMs > 0 && prev != null && (elapsed - prev) < minLapMs) {
+    pushFeedItem(`<b>Too soon</b>: ${s.name} (${fmtTime(elapsed - prev)} since last) — ignored`);
+    d.lastScanAtPerf = perfNow;
+    return;
+  }
+
+  const beforeLen = d.splits.length;
+  d.splits.push(elapsed);
+  d.lastScanAtPerf = perfNow;
+
+  session.lastActionStack.push({ studentId, removedSplit: elapsed, index: beforeLen, source, rawTagId });
+  btnUndo.disabled = session.lastActionStack.length === 0;
+
+  const st = d.splits.length; // 1..target
+  const isFinalWarn = (st === target - 1);
+  const isFinish = (st === target);
+
+  const label = isFinish ? "FINISH" : (isFinalWarn ? `t${st} (final rep)` : `t${st}`);
+
+  var srcLabel2 = (source == null || source === "") ? "SCAN" : source;
+  pushFeedItem(`<b>${label}</b> — ${s.name} — ${fmtTime(elapsed)} <span style="color:#555">(${srcLabel2})</span>`);
+  renderGrid();
+}
+
+function recordPassByTagId(tagId) {
+  const clean = String(tagId).trim();
+  if (!clean) return;
+
+  const s = students.find(x => x.tagId === clean);
+  if (!s) {
+    pushFeedItem(`<b>Unknown tag</b>: ${clean}`);
+    return;
+  }
+  recordPassByStudentId(s.id, { source: "SCAN", rawTagId: clean });
+}
+
+// ===== Session controls =====
+function startRun() {
+  if (students.length === 0) {
+    alert("Please load a roster CSV first.");
+    return;
+  }
+
+  // Lock in sessionConfig at the moment Start is pressed
+  if (sessionPreset && sessionPreset.value === "custom") {
+    const reps = clampInt(customReps && customReps.value, 1, 30, 3);
+    const dist = clampInt(customDist && customDist.value, 50, 5000, 600);
+    sessionConfig = { label: `${reps} × ${dist}m`, reps, repDistanceM: dist };
+  } else if (sessionPreset) {
+    sessionConfig = getPresetConfig(sessionPreset.value);
+  } else {
+    sessionConfig = { ...DEFAULT_SESSION };
+  }
+  paintSessionPanel(sessionConfig.label, sessionConfig.reps, sessionConfig.repDistanceM);
+  lockSessionControls(true);
+  updateSessionConfigPreview();
+
+  initSessionData();
+  session.started = true;
+  session.startPerf = performance.now();
+
+  btnStart.disabled = true;
+  btnStop.disabled = false;
+  btnExport.disabled = true;
+  btnUndo.disabled = true;
+
+  elFeed.innerHTML = "";
+  pushFeedItem(`<b>Started</b> — ${sessionConfig.label} — shared start time`);
+  renderGrid();
+
+  session.timerHandle = window.setInterval(() => {
+    elElapsed.textContent = fmtTime(nowElapsedMs());
+  }, 100);
+
+  focusScanInput();
+}
+
+function endRun() {
+  session.started = false;
+  btnStart.disabled = false;
+  btnStop.disabled = true;
+  btnExport.disabled = false;
+  btnUndo.disabled = false;
+
+  lockSessionControls(false);
+
+  if (session.timerHandle) window.clearInterval(session.timerHandle);
+  session.timerHandle = null;
+
+  pushFeedItem(`<b>Ended</b> — elapsed ${elElapsed.textContent}`);
+}
+
+function undoLast() {
+  const action = session.lastActionStack.pop();
+  if (!action) return;
+
+  const d = session.dataById.get(action.studentId);
+  const s = students.find(x => x.id === action.studentId);
+  if (!d || !s) return;
+
+  const idx = action.index;
+  if (d.splits[idx] === action.removedSplit) d.splits.splice(idx, 1);
+  else d.splits.pop();
+
+  pushFeedItem(`<b>Undo</b> — ${s.name} removed ${fmtTime(action.removedSplit)}`);
+  btnUndo.disabled = session.lastActionStack.length === 0;
+  renderGrid();
+}
+
+function exportCsv() {
+  const n = getTargetPasses();
+
+  const rows = [];
+  const header = [
+    "session_label",
+    "reps",
+    "rep_distance_m",
+    "student_id",
+    "name",
+    "tag_id",
+    "gender",
+    "age_group",
+    "email",
+  ];
+
+  // Raw ms columns (best for analytics)
+  for (let i = 1; i <= n; i++) header.push(`t${i}_ms`);
+  for (let i = 1; i <= n; i++) header.push(`split${i}_ms`);
+  header.push("total_ms");
+
+  // Formatted columns (MM:SS.xx)
+  for (let i = 1; i <= n; i++) header.push(`t${i}`);
+  for (let i = 1; i <= n; i++) header.push(`split${i}`);
+  header.push("total");
+
+  header.push("status");
+  rows.push(header);
+
+  for (const s of students) {
+    const d = session.dataById.get(s.id);
+    const t = (d && d.splits) ? d.splits : [];
+
+    const tMs = [];
+    const splitMs = [];
+    const tFmt = [];
+    const splitFmt = [];
+
+    for (let i = 0; i < n; i++) {
+      const ti = (t[i] != null) ? t[i] : "";
+      tMs.push(ti);
+      tFmt.push(ti === "" ? "" : fmtTime2(ti));
+    }
+
+    for (let i = 0; i < n; i++) {
+      let si = "";
+      if (t[i] == null) {
+        si = "";
+      } else if (i === 0) {
+        si = t[i];
+      } else if (t[i - 1] != null) {
+        si = t[i] - t[i - 1];
+      } else {
+        si = "";
+      }
+      splitMs.push(si);
+      splitFmt.push(si === "" ? "" : fmtTime2(si));
+    }
+
+    const finished = t.length >= n;
+    const totalMs = finished ? t[n - 1] : "";
+    const totalFmt = totalMs === "" ? "" : fmtTime2(totalMs);
+    const status = finished ? "FINISHED" : "INCOMPLETE";
+
+    rows.push([
+      sessionConfig.label,
+      sessionConfig.reps,
+      sessionConfig.repDistanceM,
+      s.id,
+      s.name,
+      s.tagId,
+      (s.gender || ""),
+      (s.ageGroup || ""),
+      (s.email || ""),
+      ...tMs,
+      ...splitMs,
+      totalMs,
+      ...tFmt,
+      ...splitFmt,
+      totalFmt,
+      status,
+    ]);
+  }
+
+  const csv = makeCsv(rows);
+  const stamp = new Date().toISOString().replaceAll(":", "-");
+
+  const safeLabel = String(sessionConfig.label)
+    .replaceAll("×", "x")
+    .replaceAll(" ", "")
+    .replaceAll("/", "-");
+
+  download(`run_${safeLabel}_${stamp}.csv`, csv);
+}
+
+// ===== Scan input handling =====
+function focusScanInput() {
+  elScanInput.focus();
+  elFocusWarn.classList.add("hidden");
+}
+
+elScanInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const val = elScanInput.value;
+    elScanInput.value = "";
+    recordPassByTagId(val);
+  }
+});
+
+document.addEventListener("click", (e) => {
+  // Don't steal focus when user is interacting with UI controls
+  const t = e.target;
+  if (
+    t.closest(".modalCard") ||          // analytics modal: don't steal focus
+    t.closest(".session-controls") ||   // preset dropdown area
+    t.closest(".hint") ||               // roster upload area
+    t.closest("button") ||
+    t.closest("label") ||
+    (t.tagName === "INPUT") ||
+    (t.tagName === "SELECT") ||
+    (t.tagName === "OPTION")
+  ) {
+    return;
+  }
+
+  // Only refocus scanning during a run (optional but recommended)
+  if (session.started) focusScanInput();
+});
+
+window.addEventListener("blur", () => elFocusWarn.classList.remove("hidden"));
+
+// ===== CSV roster handling =====
+csvFile.addEventListener("change", async (e) => {
+  const file = (e.target.files && e.target.files[0]) ? e.target.files[0] : null;
+  if (!file) return;
+
+  const text = await file.text();
+  const loaded = parseRosterCsv(text);
+
+  students = loaded.map((r) => ({
+    id: r.tagId,   // simplest: use tagId as id
+    name: (r.name && String(r.name).trim()) ? String(r.name).trim() : r.tagId,
+    tagId: r.tagId,
+    gender: r.gender || "",
+    ageGroup: r.age_group || "",
+    email: r.email || "",
+  }));
+
+  initSessionData();
+  renderGrid();
+  pushFeedItem(`<b>Roster loaded</b> — ${students.length} students`);
+  csvFile.value = "";
+});
+
+btnClearRoster.addEventListener("click", () => {
+  students = [];
+  initSessionData();
+  renderGrid();
+  pushFeedItem(`<b>Roster cleared</b>`);
+});
+
+btnSaveRoster.addEventListener("click", () => {
+  if (students.length === 0) {
+    alert("No roster loaded to save.");
+    return;
+  }
+  localStorage.setItem(ROSTER_STORAGE_KEY, JSON.stringify(students));
+  pushFeedItem(`<b>Roster saved</b> on this device`);
+});
+
+btnForgetRoster.addEventListener("click", () => {
+  localStorage.removeItem(ROSTER_STORAGE_KEY);
+  pushFeedItem(`<b>Saved roster removed</b> from this device`);
+});
+
+
+function parseRosterCsv(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+
+  const headers = splitCsvLine(lines[0]).map(h => h.trim().toLowerCase());
+  const idxTag = headers.indexOf("tagid") !== -1 ? headers.indexOf("tagid") : (headers.indexOf("tag_id") !== -1 ? headers.indexOf("tag_id") : headers.indexOf("id"));
+  const idxName = headers.indexOf("name");
+
+  const idxGender = headers.indexOf("gender") !== -1 ? headers.indexOf("gender") : (headers.indexOf("g") !== -1 ? headers.indexOf("g") : headers.indexOf("sex"));
+  const idxAge = headers.indexOf("age_group") !== -1 ? headers.indexOf("age_group") : (headers.indexOf("agegroup") !== -1 ? headers.indexOf("agegroup") : headers.indexOf("age"));
+  const idxEmail = headers.indexOf("email");
+
+  if (idxTag === -1 || idxName === -1) {
+    alert("CSV must have headers: tagId,name (optional: gender,age_group,email)");
+    return [];
+  }
+
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = splitCsvLine(lines[i]);
+    const tagId = ((cols[idxTag] == null) ? "" : cols[idxTag]).trim();
+    let name  = ((cols[idxName] == null) ? "" : cols[idxName]).trim();
+    if (!tagId) continue;
+    if (!name) name = tagId;
+
+    const gender = (idxGender !== -1 && cols[idxGender] != null) ? String(cols[idxGender]).trim() : "";
+    const age_group = (idxAge !== -1 && cols[idxAge] != null) ? String(cols[idxAge]).trim() : "";
+    const email = (idxEmail !== -1 && cols[idxEmail] != null) ? String(cols[idxEmail]).trim() : "";
+
+    out.push({ tagId, name, gender, age_group, email });
+  }
+  return out;
+}
+
+function splitCsvLine(line) {
+  const res = [];
+  let cur = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === "," && !inQuotes) {
+      res.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  res.push(cur);
+  return res;
+}
+
+
+
+// ===== Banding (Training + NAPFA + VEF + aims) =====
+const MIN_SPLITS_FOR_BANDING = 3;
+const BAND_ORDER = { "Lead": 1, "Core": 2, "Build": 3 };
+
+function normGender(g) {
+  const s = String(g || "").trim().toUpperCase();
+  if (s === "M" || s === "MALE" || s === "BOY") return "M";
+  if (s === "F" || s === "FEMALE" || s === "GIRL") return "F";
+  return "U";
+}
+
+function median(arr) {
+  const a = arr.filter(x => x != null && !Number.isNaN(x)).slice().sort((x,y)=>x-y);
+  if (a.length === 0) return null;
+  const mid = Math.floor(a.length / 2);
+  return (a.length % 2) ? a[mid] : (a[mid-1] + a[mid]) / 2;
+}
+
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+
+function repScale() {
+  const d = (analyticsData && analyticsData.repDistanceM) ? Number(analyticsData.repDistanceM) : 200;
+  const dist = (!Number.isNaN(d) && d > 0) ? d : 200;
+  return dist / 200;
+}
+
+function computeBridgeStepMs(avgMs) {
+  const s = repScale();
+  const minS = 1.0 * s;
+  const maxS = 2.0 * s;
+  const stepSec = clamp(0.03 * (avgMs / 1000), minS, maxS);
+  return stepSec * 1000;
+}
+
+function computeLeadChallengeStepMs(avgMs) {
+  const s = repScale();
+  const minS = 0.5 * s;
+  const maxS = 1.5 * s;
+  const stepSec = clamp(0.02 * (avgMs / 1000), minS, maxS);
+  return stepSec * 1000;
+}
+
+function isAnomalousForVerify(stats) {
+  const s = repScale();
+  const gapTh = 6.0 * s;
+  const fadeTh = 6.0 * s;
+  if (!stats) return true;
+  if (stats.paceGapSec != null && stats.paceGapSec >= gapTh) return true;
+  if (stats.fadeSec != null && Math.abs(stats.fadeSec) >= fadeTh) return true;
+  return false;
+}
+
+function projected24kMs(avgSplitMs, repDistanceM) {
+  const d = Number(repDistanceM || 0);
+  if (!avgSplitMs || !d || d <= 0) return null;
+  return avgSplitMs * (2400 / d);
+}
+
+function displayBandWithVef(base, verifyFlag) {
+  const txt = base || "";
+  if (!txt) return verifyFlag ? "VEF" : "";
+  return verifyFlag ? `${txt} (VEF)` : txt;
+}
+
+const NAPFA_RUN_BANDS = {
+  "14": {
+    "M": [
+      { grade: "A", maxSec: 11*60 + 0 },
+      { grade: "B", maxSec: 12*60 + 0 },
+      { grade: "C", maxSec: 13*60 + 0 },
+      { grade: "D", maxSec: 14*60 + 10 },
+      { grade: "E", maxSec: 15*60 + 20 }
+    ],
+    "F": [
+      { grade: "A", maxSec: 14*60 + 20 },
+      { grade: "B", maxSec: 15*60 + 20 },
+      { grade: "C", maxSec: 16*60 + 20 },
+      { grade: "D", maxSec: 17*60 + 20 },
+      { grade: "E", maxSec: 18*60 + 20 }
+    ]
+  },
+  "16": {
+    "M": [
+      { grade: "A", maxSec: 10*60 + 30 },
+      { grade: "B", maxSec: 11*60 + 30 },
+      { grade: "C", maxSec: 12*60 + 20 },
+      { grade: "D", maxSec: 13*60 + 20 },
+      { grade: "E", maxSec: 14*60 + 10 }
+    ],
+    "F": [
+      { grade: "A", maxSec: 14*60 + 0 },
+      { grade: "B", maxSec: 15*60 + 0 },
+      { grade: "C", maxSec: 16*60 + 0 },
+      { grade: "D", maxSec: 17*60 + 0 },
+      { grade: "E", maxSec: 17*60 + 50 }
+    ]
+  }
+};
+
+function estimateNapfaBand(projected24kMsVal, ageGroup, gender) {
+  const sec = projected24kMsVal != null ? projected24kMsVal / 1000 : null;
+  if (sec == null || Number.isNaN(sec)) return "";
+  const a = String(ageGroup || (analyticsAge ? analyticsAge.value : "16"));
+  const g = normGender(gender);
+  if (g !== "M" && g !== "F") return "";
+  const rules = (NAPFA_RUN_BANDS[a] && NAPFA_RUN_BANDS[a][g]) ? NAPFA_RUN_BANDS[a][g] : null;
+  if (!rules) return "";
+  for (const r of rules) {
+    if (sec <= r.maxSec) return r.grade;
+  }
+  return "E";
+}
+
+function buildRosterIndex() {
+  const m = {};
+  if (Array.isArray(students)) {
+    for (const s of students) {
+      if (s && s.tagId) m[String(s.tagId || "").trim()] = s;
+    }
+  }
+  return m;
+}
+
+function assignTrainingBands(rows) {
+  const groups = { M: [], F: [], U: [] };
+  for (const r of rows) groups[r.genderNorm || "U"].push(r);
+
+  for (const g of Object.keys(groups)) {
+    const groupRows = groups[g];
+    const candidates = groupRows.filter(r => r.projected24kMs != null && !Number.isNaN(r.projected24kMs));
+    const enoughForNorm = candidates.length >= 3;
+
+    for (const r of groupRows) {
+      r.trainingBand = "Build";
+      r.verifyFlag = true;
+    }
+
+    if (enoughForNorm) {
+      candidates.sort((a,b)=>a.projected24kMs-b.projected24kMs);
+      const n = candidates.length;
+      const cut1 = Math.ceil(n/3);
+      const cut2 = Math.ceil(2*n/3);
+      for (let i=0;i<n;i++){
+        candidates[i].trainingBand = (i < cut1) ? "Lead" : (i < cut2 ? "Core" : "Build");
+      }
+    }
+
+    for (const r of groupRows) {
+      const lowSplits = (r.nSplits == null) || (r.nSplits < MIN_SPLITS_FOR_BANDING);
+      const incomplete = String(r.status || "").toUpperCase() !== "FINISHED";
+      const anomalous = !!r._anomalyFlag;
+      const notEnoughPeers = !enoughForNorm;
+      r.verifyFlag = lowSplits || incomplete || anomalous || notEnoughPeers;
+      r.trainingBandDisplay = displayBandWithVef(r.trainingBand, r.verifyFlag);
+    }
+  }
+}
+
+function attachAims(rows) {
+  const med = {};
+  for (const r of rows) {
+    const g = r.genderNorm || "U";
+    if (!med[g]) med[g] = {};
+  }
+
+  for (const g of Object.keys(med)) {
+    const byBand = { Lead: [], Core: [], Build: [] };
+    for (const r of rows) {
+      if ((r.genderNorm || "U") !== g) continue;
+      if (r.avgMs == null) continue;
+      if (r.trainingBand === "Lead") byBand.Lead.push(r.avgMs);
+      if (r.trainingBand === "Core") byBand.Core.push(r.avgMs);
+      if (r.trainingBand === "Build") byBand.Build.push(r.avgMs);
+    }
+    med[g].Lead = median(byBand.Lead);
+    med[g].Core = median(byBand.Core);
+    med[g].Build = median(byBand.Build);
+  }
+
+  for (const r of rows) {
+    const g = r.genderNorm || "U";
+    const mLead = med[g]?.Lead ?? null;
+    const mCore = med[g]?.Core ?? null;
+
+    let stretch = null;
+    if (r.trainingBand === "Build") stretch = mCore;
+    else if (r.trainingBand === "Core") stretch = mLead;
+    else if (r.trainingBand === "Lead" && r.avgMs != null) {
+      stretch = Math.max(0, r.avgMs - computeLeadChallengeStepMs(r.avgMs));
+    }
+
+    let bridge = null;
+    if ((r.trainingBand === "Build" || r.trainingBand === "Core") && r.avgMs != null) {
+      const step = computeBridgeStepMs(r.avgMs);
+      bridge = Math.max(0, r.avgMs - step);
+      if (stretch != null) bridge = Math.max(stretch, bridge);
+    }
+
+    r.aimStretchMs = stretch;
+    r.aimBridgeMs = bridge;
+    r.deltaStretchSec = (stretch != null && r.avgMs != null) ? ((r.avgMs - stretch)/1000) : null;
+    r.deltaBridgeSec  = (bridge != null && r.avgMs != null) ? ((r.avgMs - bridge)/1000) : null;
+  }
+}
+
+// ===== Class View (build + render) =====
+let classRows = [];
+
+function buildClassRowsFromAnalytics() {
+  const rows = [];
+  if (!analyticsData || !analyticsData.byTag) return rows;
+
+  const rosterIdx = buildRosterIndex();
+  const keys = Object.keys(analyticsData.byTag);
+
+  for (let i = 0; i < keys.length; i++) {
+    const tagId = keys[i];
+    const row = analyticsData.byTag[tagId];
+    const splits = (row.splitsMs || []).slice();
+    const stats = computePacingStats(splits);
+    if (!stats) continue;
+
+    let totalMs = row.totalMs;
+    if (totalMs == null) {
+      let sum = 0;
+      for (let k = 0; k < splits.length; k++) if (splits[k] != null) sum += splits[k];
+      totalMs = sum > 0 ? sum : null;
+    }
+
+    const rosterRec = rosterIdx[String(tagId).trim()] || null;
+    const gender = String(row.gender || (rosterRec ? rosterRec.gender : "") || "").trim();
+    const ageGroup = String(row.age_group || (rosterRec ? (rosterRec.ageGroup || rosterRec.age_group || "") : "") || (analyticsAge ? analyticsAge.value : "16")).trim();
+    const email = String(row.email || (rosterRec ? rosterRec.email : "") || "").trim();
+    const projected = projected24kMs(stats.avg, analyticsData.repDistanceM);
+
+    rows.push({
+      tagId,
+      name: row.name || tagId,
+      gender,
+      genderNorm: normGender(gender),
+      ageGroup,
+      email,
+      nSplits: stats.n,
+      status: row.status || "UNKNOWN",
+      avgMs: stats.avg,
+      paceGapSec: stats.paceGapSec,
+      fadeSec: stats.fadeSec,
+      totalMs,
+      projected24kMs: projected,
+      napfaBand: estimateNapfaBand(projected, ageGroup, gender),
+      group: classifyPacingFromStats(stats),
+      _anomalyFlag: isAnomalousForVerify(stats),
+    });
+  }
+
+  assignTrainingBands(rows);
+  attachAims(rows);
+
+  rows.sort((a, b) => {
+    const ao = BAND_ORDER[a.trainingBand] || 9;
+    const bo = BAND_ORDER[b.trainingBand] || 9;
+    if (ao !== bo) return ao - bo;
+    return String(a.name).localeCompare(String(b.name));
+  });
+  return rows;
+}
+
+function getBandMode() {
+  return bandingMode ? bandingMode.value : "both";
+}
+
+function renderClassTable() {
+  if (!classTable) return;
+  if (!analyticsData) {
+    classTable.innerHTML = "";
+    if (classCount) classCount.textContent = "";
+    return;
+  }
+
+  const finishedOnly = !!(onlyFinished && onlyFinished.checked);
+  const rows = finishedOnly ? classRows.filter(r => r.status === "FINISHED") : classRows.slice();
+  if (classCount) classCount.textContent = `${rows.length} students`;
+
+  const mode = getBandMode();
+  let html = "";
+  html += "<thead><tr>";
+  html += "<th>Name</th><th>Tag</th><th>G</th>";
+  if (mode === "both" || mode === "training") html += "<th>Training</th>";
+  if (mode === "both" || mode === "napfa") html += "<th>NAPFA</th>";
+  html += "<th>Avg split</th><th>Bridge aim</th><th>ΔBridge</th><th>Stretch aim</th><th>ΔStretch</th><th>Pace gap (s)</th><th>Fade (s)</th><th>Total</th><th>Group</th><th>Status</th>";
+  html += "</tr></thead><tbody>";
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    html += "<tr>";
+    html += `<td>${escapeHtml(r.name)}</td>`;
+    html += `<td>${escapeHtml(r.tagId)}</td>`;
+    html += `<td>${escapeHtml(r.genderNorm)}</td>`;
+    if (mode === "both" || mode === "training") html += `<td><span class="badge">${escapeHtml(r.trainingBandDisplay || r.trainingBand || "")}</span></td>`;
+    if (mode === "both" || mode === "napfa") html += `<td><span class="badge">${escapeHtml(r.napfaBand || "")}</span></td>`;
+    html += `<td>${fmtTime2(r.avgMs)}</td>`;
+    html += `<td>${r.aimBridgeMs != null ? fmtTime2(r.aimBridgeMs) : ""}</td>`;
+    html += `<td>${r.deltaBridgeSec != null ? formatSignedSeconds(r.deltaBridgeSec, true) : ""}</td>`;
+    html += `<td>${r.aimStretchMs != null ? fmtTime2(r.aimStretchMs) : ""}</td>`;
+    html += `<td>${r.deltaStretchSec != null ? formatSignedSeconds(r.deltaStretchSec, true) : ""}</td>`;
+    html += `<td>${formatSignedSeconds(r.paceGapSec, false)}</td>`;
+    html += `<td>${formatSignedSeconds(r.fadeSec, true)}</td>`;
+    html += `<td>${r.totalMs != null ? fmtTime2(r.totalMs) : ""}</td>`;
+    html += `<td>${escapeHtml(r.group)}</td>`;
+    html += `<td>${escapeHtml(r.status)}</td>`;
+    html += "</tr>";
+  }
+
+  html += "</tbody>";
+  classTable.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (ch) => {
+    switch (ch) {
+      case "&": return "&amp;";
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case '"': return "&quot;";
+      case "'": return "&#039;";
+      default: return ch;
+    }
+  });
+}
+
+function formatSignedSeconds(sec, allowNegative) {
+  if (sec == null || Number.isNaN(sec)) return "";
+  const s = Number(sec);
+  const sign = (s > 0) ? "+" : (s < 0 ? "-" : "");
+  const abs = Math.abs(s).toFixed(2);
+  if (!allowNegative && sign === "-") return abs;
+  return sign + abs;
+}
+
+function inferClassPrefixFromTags(tags) {
+  if (!tags || tags.length === 0) return "class";
+  let prefix = String(tags[0] || "");
+  for (let i = 1; i < tags.length; i++) {
+    const t = String(tags[i] || "");
+    let j = 0;
+    while (j < prefix.length && j < t.length && prefix[j] === t[j]) j++;
+    prefix = prefix.slice(0, j);
+    if (prefix.length === 0) break;
+  }
+  const m = prefix.match(/^(\d+[A-Za-z]+)/);
+  if (m) return m[1];
+  return prefix ? prefix : "class";
+}
+
+// ===== Analytics (CSV -> Student -> Chart) =====
+let analyticsData = null; // { reps, sessionLabel, repDistanceM, byTag: { tagId: { name, splitsMs, totalMs, status } } }
+
+// ===== Email (Apps Script Web App) =====
+const SCRIPT_URL_KEY = "pacecoach_script_url_v1";
+
+function getScriptUrl() {
+  const v = scriptUrlInput ? String(scriptUrlInput.value || "").trim() : "";
+  return v;
+}
+
+function loadScriptUrl() {
+  try {
+    const saved = localStorage.getItem(SCRIPT_URL_KEY) || "";
+    if (scriptUrlInput && saved) scriptUrlInput.value = saved;
+  } catch (e) {}
+}
+
+function saveScriptUrl() {
+  try {
+    const v = getScriptUrl();
+    if (v) localStorage.setItem(SCRIPT_URL_KEY, v);
+  } catch (e) {}
+}
+
+function setEmailStatus(msg, isError) {
+  if (!emailStatus) return;
+  emailStatus.textContent = msg || "";
+  emailStatus.style.color = isError ? "#b91c1c" : "#334155";
+}
+
+function updateSendClassButtonLabel() {
+  if (!btnSendClassEmails) return;
+  const finishedOnly = !!(onlyFinished && onlyFinished.checked);
+  btnSendClassEmails.textContent = finishedOnly ? "Send class (Finished only)" : "Send class (All shown)";
+}
+
+
+function getClassRow(tagId) {
+  if (!classRows || classRows.length === 0) return null;
+  for (let i = 0; i < classRows.length; i++) {
+    if (classRows[i].tagId === tagId) return classRows[i];
+  }
+  return null;
+}
+
+function drawPaceLine(canvas, splitsMs, aimBridgeMs, aimStretchMs) {
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const splits = splitsMs.filter(x => x != null);
+  if (splits.length === 0) {
+    ctx.fillStyle = "#0f172a";
+    ctx.font = "14px system-ui";
+    ctx.fillText("No split data.", 16, 24);
+    return;
+  }
+
+  const padL = 42, padR = 18, padT = 18, padB = 34;
+  const chartW = w - padL - padR;
+  const chartH = h - padT - padB;
+
+  let min = Math.min(...splits);
+  let max = Math.max(...splits);
+
+  if (aimBridgeMs != null) { min = Math.min(min, aimBridgeMs); max = Math.max(max, aimBridgeMs); }
+  if (aimStretchMs != null) { min = Math.min(min, aimStretchMs); max = Math.max(max, aimStretchMs); }
+
+  const yMin = min * 0.97;
+  const yMax = max * 1.03;
+
+  const n = splitsMs.length;
+  const xStep = (n <= 1) ? 0 : (chartW / (n - 1));
+
+  function x(i) { return padL + i * xStep; }
+  function y(ms) {
+    const t = (ms - yMin) / (yMax - yMin || 1);
+    return padT + chartH - t * chartH;
+  }
+
+  // axes
+  ctx.strokeStyle = "#e5e7eb";
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + chartH);
+  ctx.lineTo(padL + chartW, padT + chartH);
+  ctx.stroke();
+
+  // aim lines
+  function aimLine(ms, label) {
+    if (ms == null) return;
+    ctx.strokeStyle = "#94a3b8";
+    ctx.setLineDash([4,4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y(ms));
+    ctx.lineTo(padL + chartW, y(ms));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#475569";
+    ctx.font = "11px system-ui";
+    ctx.fillText(label, padL + 6, y(ms) - 4);
+  }
+  aimLine(aimBridgeMs, "bridge");
+  aimLine(aimStretchMs, "stretch");
+
+  // line
+  ctx.strokeStyle = "#2563eb";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < n; i++) {
+    const ms = splitsMs[i];
+    if (ms == null) continue;
+    if (!started) { ctx.moveTo(x(i), y(ms)); started = true; }
+    else ctx.lineTo(x(i), y(ms));
+  }
+  ctx.stroke();
+
+  // points
+  ctx.fillStyle = "#2563eb";
+  for (let i = 0; i < n; i++) {
+    const ms = splitsMs[i];
+    if (ms == null) continue;
+    ctx.beginPath();
+    ctx.arc(x(i), y(ms), 3, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // x labels
+  ctx.fillStyle = "#0f172a";
+  ctx.font = "11px system-ui";
+  for (let i = 0; i < n; i++) {
+    ctx.fillText(String(i+1), x(i) - 3, padT + chartH + 20);
+  }
+}
+
+function makeEmailChartBase64(tagId) {
+  const row = (analyticsData && analyticsData.byTag) ? analyticsData.byTag[tagId] : null;
+  if (!row) return "";
+  const classRow = getClassRow(tagId);
+
+  const c = document.createElement("canvas");
+  c.width = 640;
+  c.height = 240;
+
+  const stats = computePacingStats(row.splitsMs || []);
+  const avgMs = stats ? stats.avg : null;
+
+  // Use the same bar chart style as teacher view (clearer in email).
+  drawSplitBars(
+    c,
+    row.splitsMs || [],
+    avgMs,
+    classRow ? classRow.aimBridgeMs : null,
+    classRow ? classRow.aimStretchMs : null
+  );
+
+  const dataUrl = c.toDataURL("image/png");
+  const parts = dataUrl.split(",");
+  return parts.length > 1 ? parts[1] : "";
+}
+
+async function postToScript(payload) {
+  const url = getScriptUrl();
+  if (!url) throw new Error("Missing Apps Script URL.");
+
+  // Try normal CORS request first (works in some environments).
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // simple request type
+      body: JSON.stringify(payload),
+    });
+
+    // If CORS allows reading the response, we use it.
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || json.ok === false) {
+      throw new Error(json.error || ("Request failed (" + res.status + ")"));
+    }
+    return json;
+  } catch (err) {
+    // Many school browsers block cross-origin reads to Apps Script.
+    // Fallback: send as no-cors (request still goes through, but response is opaque).
+    const msg = String(err && err.message ? err.message : err);
+    if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("CORS")) {
+      await fetch(url, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(payload),
+      });
+      return { ok: true, opaque: true };
+    }
+    throw err;
+  }
+}
+
+
+function buildEmailGlowGrow(tagId, row, classRow, stats) {
+  const pacingGroup = classifyPacingFromStats(stats);
+  const base = feedbackLines(pacingGroup, stats);
+
+  // Prefer explicit training aim in "Next goal" (bridge for Build/Core, stretch for Lead/Core).
+  let aimLine = "";
+  if (classRow) {
+    if (classRow.trainingBand === "Lead" && classRow.aimStretchMs != null) {
+      aimLine = `Aim (challenge): ${fmtTime2(classRow.aimStretchMs)} per rep.`;
+    } else if ((classRow.trainingBand === "Core" || classRow.trainingBand === "Build") && classRow.aimBridgeMs != null) {
+      aimLine = `Aim (bridge): ${fmtTime2(classRow.aimBridgeMs)} per rep.`;
+    } else if (classRow.aimStretchMs != null) {
+      aimLine = `Aim: ${fmtTime2(classRow.aimStretchMs)} per rep.`;
+    }
+  }
+
+  const vefNote = (classRow && classRow.verifyFlag) ? " (VEF: teacher to verify quickly)" : "";
+
+  return {
+    pacingType: pacingGroup,
+    glow: base.glow,
+    grow: base.growth,
+    nextGoal: (aimLine ? (aimLine + " ") : "") + base.nextGoal,
+    bandDisplay: classRow ? (classRow.trainingBandDisplay || classRow.trainingBand || "") : "",
+    vefNote
+  };
+}
+
+async function sendOneStudentEmail(tagId) {
+  if (!analyticsData || !analyticsData.byTag) throw new Error("Upload a run CSV first.");
+  const row = analyticsData.byTag[tagId];
+  if (!row) throw new Error("Student not found.");
+
+  let to = String(row.email || "").trim();
+  if (!to) {
+    to = prompt("No email found for this student. Enter email to send:", "") || "";
+    to = String(to).trim();
+    if (!to) throw new Error("No email provided.");
+    row.email = to;
+  }
+
+  const classRow = getClassRow(tagId);
+  const stats = computePacingStats(row.splitsMs || []);
+  const fb = buildEmailGlowGrow(tagId, row, classRow, stats);
+
+  const subject = `[Pace Coach] ${analyticsData.sessionLabel || "Run"} – ${row.name || tagId}`;
+
+  const payload = {
+    type: "pacecoach_email_v2",
+    run_key: analyticsData.runKey || ("manual_" + Date.now()),
+    to,
+    subject,
+    teacher_note: teacherNoteInput ? String(teacherNoteInput.value || "").trim() : "",
+    session: {
+      class_code: (document.getElementById("classCode") ? String(document.getElementById("classCode").value || "").trim() : ""),
+      session_label: analyticsData.sessionLabel || "Run",
+      reps: analyticsData.reps || 0,
+      rep_distance_m: analyticsData.repDistanceM || 0
+    },
+    student: {
+      tag_id: tagId,
+      name: row.name || tagId
+    },
+    metrics: classRow ? {
+      band: (classRow.trainingBandDisplay || classRow.trainingBand || ""),
+      training_band: classRow.trainingBand || "",
+      napfa_band: classRow.napfaBand || "",
+      verify_flag: !!classRow.verifyFlag,
+      pacing_type: classRow.group || "",
+      avg_ms: classRow.avgMs,
+      pace_gap_sec: classRow.paceGapSec,
+      fade_sec: classRow.fadeSec,
+      aim_bridge_ms: classRow.aimBridgeMs,
+      aim_stretch_ms: classRow.aimStretchMs
+    } : {},
+    feedback: {
+      glow: fb.glow,
+      grow: fb.grow,
+      next_goal: fb.nextGoal
+    },
+    chart_png_base64: makeEmailChartBase64(tagId)
+  };
+
+  return await postToScript(payload);
+}
+
+async function sendSelectedStudentEmail() {
+  try {
+    setEmailStatus("Sending…");
+    const tagId = analyticsStudent ? analyticsStudent.value : "";
+    if (!tagId) { setEmailStatus("Select a student first.", true); return; }
+    await sendOneStudentEmail(tagId);
+    setEmailStatus("Sent ✓");
+  } catch (e) {
+    setEmailStatus(String(e.message || e), true);
+  }
+}
+
+async function sendClassEmails() {
+  try {
+    if (!analyticsData) { setEmailStatus("Upload a run CSV first.", true); return; }
+
+    const finishedOnly = !!(onlyFinished && onlyFinished.checked);
+    const rows = finishedOnly ? classRows.filter(r => r.status === "FINISHED") : classRows.slice();
+
+    let sent = 0, skipped = 0, total = rows.length;
+    setEmailStatus(`Sending 0/${total}…`);
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const tagId = r.tagId;
+      const row = analyticsData.byTag[tagId];
+      const email = row ? String(row.email || "").trim() : "";
+      if (!email) { skipped++; continue; }
+
+      try {
+        await sendOneStudentEmail(tagId);
+        sent++;
+      } catch (err) {
+        // continue, but surface last error briefly
+      }
+      setEmailStatus(`Sent ${sent}/${total} (skipped ${skipped})…`);
+      // light throttle
+      await new Promise(res => setTimeout(res, 250));
+    }
+
+    setEmailStatus(`Done. Sent ${sent}/${total}. Skipped ${skipped}.`);
+  } catch (e) {
+    setEmailStatus(String(e.message || e), true);
+  }
+}
+
+
+function parseTimeToMs(v) {
+  if (v == null) return null;
+  var s = String(v).trim();
+  if (s === "") return null;
+
+  // numeric ms (most common)
+  var num = Number(s);
+  if (!Number.isNaN(num)) return num;
+
+  // formatted "MM:SS.xx" or "MM:SS.t"
+  // Example: 02:15.34
+  var m = s.match(/^(\d+):(\d{2})\.(\d{1,2})$/);
+  if (m) {
+    var minutes = Number(m[1]);
+    var seconds = Number(m[2]);
+    var frac = m[3]; // tenths or centis
+    var fracMs = (frac.length === 1) ? Number(frac) * 100 : Number(frac) * 10; // .t => 100ms, .xx => 10ms
+    return minutes * 60000 + seconds * 1000 + fracMs;
+  }
+
+  return null;
+}
+
+
+function hashTextDjb2(str) {
+  // Simple deterministic hash for dedupe keys (same CSV => same run_key)
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h) + str.charCodeAt(i); // h*33 + c
+    h = h >>> 0;
+  }
+  return h.toString(16);
+}
+
+
+function parseRunCsvForAnalytics(text) {
+  var lines = text.split(/\r?\n/).filter(function (l) { return l.trim() !== ""; });
+  if (lines.length < 2) return null;
+
+  var headers = splitCsvLine(lines[0]).map(function (h) { return h.trim(); });
+
+  var idxTag = headers.indexOf("tag_id");
+  if (idxTag === -1) idxTag = headers.indexOf("tagId");
+  if (idxTag === -1) idxTag = headers.indexOf("tagid");
+  var idxName = headers.indexOf("name");
+  var idxGender = headers.indexOf("gender");
+  var idxAgeGroup = headers.indexOf("age_group");
+  if (idxAgeGroup === -1) idxAgeGroup = headers.indexOf("agegroup");
+  if (idxAgeGroup === -1) idxAgeGroup = headers.indexOf("age");
+  var idxEmail = headers.indexOf("email");
+  if (idxEmail === -1) idxEmail = headers.indexOf("student_email");
+  if (idxEmail === -1) idxEmail = headers.indexOf("studentEmail");
+  if (idxTag === -1 || idxName === -1) return null;
+
+  var splitIdx = [];
+  var reps = 0;
+
+  for (var i = 1; i <= 30; i++) {
+    var ci = headers.indexOf("split" + i + "_ms");
+    if (ci !== -1) {
+      splitIdx.push(ci);
+      reps = i;
+    } else {
+      break;
+    }
+  }
+
+  if (reps === 0) {
+    for (var j = 1; j <= 30; j++) {
+      var li = headers.indexOf("lap" + j);
+      if (li !== -1) {
+        splitIdx.push(li);
+        reps = j;
+      } else {
+        break;
+      }
+    }
+  }
+
+  var tIdx = [];
+  if (reps === 0) {
+    for (var k = 1; k <= 30; k++) {
+      var ti = headers.indexOf("t" + k);
+      if (ti !== -1) {
+        tIdx.push(ti);
+        reps = k;
+      } else {
+        break;
+      }
+    }
+  }
+
+  if (reps === 0) return null;
+
+  var idxSession = headers.indexOf("session_label");
+  var idxReps = headers.indexOf("reps");
+  var idxDist = headers.indexOf("rep_distance_m");
+
+  var sessionLabel = "Run";
+  var repDistanceM = 0;
+  var runKey = "h" + hashTextDjb2(text);
+
+  var cols1 = splitCsvLine(lines[1]);
+  if (idxSession !== -1) {
+    var sl = (cols1[idxSession] == null) ? "" : String(cols1[idxSession]).trim();
+    if (sl) sessionLabel = sl;
+  }
+  if (idxReps !== -1) {
+    var rr = (cols1[idxReps] == null) ? "" : String(cols1[idxReps]).trim();
+    var rrn = Number(rr);
+    if (!Number.isNaN(rrn) && rrn > 0) reps = rrn;
+  }
+  if (idxDist !== -1) {
+    var dd = (cols1[idxDist] == null) ? "" : String(cols1[idxDist]).trim();
+    var ddn = Number(dd);
+    if (!Number.isNaN(ddn)) repDistanceM = ddn;
+  }
+
+  var idxTotalMs = headers.indexOf("total_ms");
+  var idxTotal = headers.indexOf("total");
+  var idxStatus = headers.indexOf("status");
+
+  var byTag = {};
+
+  for (var r = 1; r < lines.length; r++) {
+    var cols = splitCsvLine(lines[r]);
+    var tagId = (cols[idxTag] == null) ? "" : String(cols[idxTag]).trim();
+    var name = (cols[idxName] == null) ? "" : String(cols[idxName]).trim();
+    if (!tagId) continue;
+
+    var splitsMs = [];
+    if (splitIdx.length > 0) {
+      for (var a = 0; a < reps; a++) {
+        var c = splitIdx[a];
+        var raw = (c == null || c === -1 || cols[c] == null) ? "" : String(cols[c]).trim();
+        var ms = parseTimeToMs(raw);
+        splitsMs.push(ms);
+      }
+    } else if (tIdx.length > 0) {
+      var prev = null;
+      for (var b = 0; b < reps; b++) {
+        var tc = tIdx[b];
+        var traw = (tc == null || cols[tc] == null) ? "" : String(cols[tc]).trim();
+        var tms = parseTimeToMs(traw);
+        if (tms == null) splitsMs.push(null);
+        else if (prev == null) { splitsMs.push(tms); prev = tms; }
+        else { splitsMs.push(tms - prev); prev = tms; }
+      }
+    }
+
+    var totalRaw = "";
+    if (idxTotalMs !== -1) totalRaw = (cols[idxTotalMs] == null) ? "" : String(cols[idxTotalMs]).trim();
+    else if (idxTotal !== -1) totalRaw = (cols[idxTotal] == null) ? "" : String(cols[idxTotal]).trim();
+
+    var totalMs = parseTimeToMs(totalRaw);
+    var status = (idxStatus === -1) ? "" : ((cols[idxStatus] == null) ? "" : String(cols[idxStatus]).trim());
+    if (!status) status = "UNKNOWN";
+
+    byTag[tagId] = {
+      name: name || tagId,
+      gender: (idxGender === -1) ? "" : ((cols[idxGender] == null) ? "" : String(cols[idxGender]).trim()),
+      age_group: (idxAgeGroup === -1) ? "" : ((cols[idxAgeGroup] == null) ? "" : String(cols[idxAgeGroup]).trim()),
+      email: (idxEmail === -1) ? "" : ((cols[idxEmail] == null) ? "" : String(cols[idxEmail]).trim()),
+      splitsMs: splitsMs,
+      totalMs: totalMs,
+      status: status
+    };
+  }
+
+  return { reps: reps, sessionLabel: sessionLabel, repDistanceM: repDistanceM, byTag: byTag, runKey: runKey };
+}
+
+function computePacingStats(splitsMs) {
+  const splits = splitsMs.filter(function (x) { return x != null; });
+  const n = splits.length;
+  if (n === 0) return null;
+
+  let sum = 0, min = Infinity, max = -Infinity;
+  for (let i = 0; i < n; i++) {
+    sum += splits[i];
+    if (splits[i] < min) min = splits[i];
+    if (splits[i] > max) max = splits[i];
+  }
+  const avg = sum / n;
+
+  // Student-friendly metrics (seconds)
+  const paceGapMs = (max - min);              // slowest - fastest
+  const fadeMs = (splits[n - 1] - splits[0]); // last - first (positive = slowed)
+
+  const paceGapSec = paceGapMs / 1000;
+  const fadeSec = fadeMs / 1000;
+
+  // Detect "wavy" (many direction changes)
+  let signChanges = 0;
+  let prevSign = 0;
+  for (let i = 1; i < n; i++) {
+    const diff = splits[i] - splits[i - 1];
+    const sign = diff === 0 ? 0 : (diff > 0 ? 1 : -1);
+    if (prevSign !== 0 && sign !== 0 && sign !== prevSign) signChanges++;
+    if (sign !== 0) prevSign = sign;
+  }
+
+  // Labels
+  let label = "Mixed pace";
+  if (paceGapSec <= 1.0 && Math.abs(fadeSec) <= 0.6) label = "Even pace (goal)";
+  else if (fadeSec >= 1.2) label = "Fast start → fade";
+  else if (fadeSec <= -1.0) label = "Negative split (strong finish)";
+  else if (paceGapSec >= 2.0 && signChanges >= 2) label = "Wavy / inconsistent";
+
+  return {
+    n, avg, min, max,
+    paceGapMs, fadeMs,
+    paceGapSec, fadeSec,
+    label
+  };
+}
+
+function safeNum(x) {
+  return (x != null && !Number.isNaN(x)) ? x : null;
+}
+
+function classifyPacingFromStats(stats) {
+  // Map into exactly 4 student-friendly groups
+  if (!stats) return "No data";
+
+  // Use the label computed from computePacingStats first
+  if (stats.label.indexOf("Even") !== -1) return "Even pace (goal)";
+  if (stats.label.indexOf("Fast start") !== -1) return "Fast start → fade";
+  if (stats.label.indexOf("Negative") !== -1) return "Negative split";
+  if (stats.label.indexOf("Wavy") !== -1) return "Wavy / inconsistent";
+
+  // Fallback rules
+  if (stats.fadeSec >= 1.2) return "Fast start → fade";
+  if (stats.fadeSec <= -1.0) return "Negative split";
+  if (stats.paceGapSec >= 2.0) return "Wavy / inconsistent";
+  return "Mixed pace";
+}
+
+function feedbackLines(group, stats) {
+  if (!stats) {
+    return {
+      glow: "You completed the run — good effort.",
+      growth: "Next time, try to keep your reps more consistent.",
+      nextGoal: "Record all reps and aim for steadier pacing."
+    };
+  }
+
+  const avg = fmtTime2(stats.avg);
+
+  if (group === "Even pace (goal)") {
+    return {
+      glow: "Great control — your reps are nicely even.",
+      growth: "Now try to hold the same control at a slightly faster pace.",
+      nextGoal: `Keep pace gap ≤ 1.00s and aim ~${avg} per rep.`
+    };
+  }
+
+  if (group === "Fast start → fade") {
+    return {
+      glow: "Strong start speed — you can move fast.",
+      growth: "Work on finishing strong: reduce fade by pacing the first rep.",
+      nextGoal: "Start 1–2s calmer in Rep 1. Aim fade < +1.00s and pace gap < 2.00s."
+    };
+  }
+
+  if (group === "Negative split") {
+    return {
+      glow: "Strong finish — you got faster as you went.",
+      growth: "Bring that pace earlier so the whole run improves.",
+      nextGoal: "Try to match your finishing pace by Rep 2–3. Keep pace gap < 2.00s."
+    };
+  }
+
+  if (group === "Wavy / inconsistent") {
+    return {
+      glow: "You had bursts of speed — good potential.",
+      growth: "Aim for smoother reps (less up/down).",
+      nextGoal: `Keep each rep within ~±1.50s of your average (${avg}). Narrow pace gap.`
+    };
+  }
+
+  return {
+    glow: "Good job completing the reps.",
+    growth: "Focus on narrowing your pace gap and reducing fade.",
+    nextGoal: "Aim pace gap < 2.00s and fade close to 0.00s."
+  };
+}
+
+function drawSplitBars(canvas, splitsMs, avgMs, aimBridgeMs, aimStretchMs) {
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const splits = splitsMs.slice(0);
+  const valid = splits.filter(function (x) { return x != null; });
+  if (valid.length === 0) {
+    ctx.fillStyle = "#111";
+    ctx.font = "14px system-ui";
+    ctx.fillText("No split data.", 20, 30);
+    return;
+  }
+
+  let max = Math.max.apply(null, valid);
+  let min = Math.min.apply(null, valid);
+
+  if (aimBridgeMs != null) { max = Math.max(max, aimBridgeMs); min = Math.min(min, aimBridgeMs); }
+  if (aimStretchMs != null) { max = Math.max(max, aimStretchMs); min = Math.min(min, aimStretchMs); }
+
+  const padL = 50, padR = 18, padT = 18, padB = 38;
+  const chartW = w - padL - padR;
+  const chartH = h - padT - padB;
+
+  const yMax = max * 1.05;
+  const yMin = min * 0.95;
+
+  function y(ms) {
+    const t = (ms - yMin) / (yMax - yMin || 1);
+    return padT + chartH - (t * chartH);
+  }
+
+  // axes
+  ctx.strokeStyle = "#e5e7eb";
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + chartH);
+  ctx.lineTo(padL + chartW, padT + chartH);
+  ctx.stroke();
+
+  // helper aim lines
+  function aimLine(ms, label) {
+    if (ms == null) return;
+    ctx.strokeStyle = "#94a3b8";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y(ms));
+    ctx.lineTo(padL + chartW, y(ms));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#475569";
+    ctx.font = "12px system-ui";
+    ctx.fillText(label, padL + 6, y(ms) - 6);
+  }
+
+  // avg line
+  if (avgMs != null) {
+    ctx.strokeStyle = "#64748b";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y(avgMs));
+    ctx.lineTo(padL + chartW, y(avgMs));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#334155";
+    ctx.font = "12px system-ui";
+    ctx.fillText("avg", padL + 6, y(avgMs) - 6);
+  }
+
+  // aim lines
+  aimLine(aimBridgeMs, "bridge");
+  aimLine(aimStretchMs, "stretch");
+
+  const n = splits.length;
+  const gap = 10;
+  const barW = Math.max(18, Math.floor((chartW - gap * (n - 1)) / n));
+
+  for (let i = 0; i < n; i++) {
+    const ms = splits[i];
+    const x = padL + i * (barW + gap);
+
+    ctx.fillStyle = "#111";
+    ctx.font = "12px system-ui";
+    ctx.fillText(String(i + 1), x + barW / 2 - 3, padT + chartH + 22);
+
+    if (ms == null) {
+      ctx.fillStyle = "#e5e7eb";
+      ctx.fillRect(x, padT + chartH - 10, barW, 10);
+      continue;
+    }
+
+    const yTop = y(ms);
+    const yBase = padT + chartH;
+    const barH = yBase - yTop;
+
+    ctx.fillStyle = "#93c5fd";
+    ctx.fillRect(x, yTop, barW, barH);
+
+    // value label: center above bar, with simple collision avoidance (prevents "jumbled" text)
+    const label = fmtTime2(ms);
+    ctx.font = "12px system-ui";
+    ctx.textAlign = "center";
+
+    let ly = yTop - 6;
+    let baseline = "bottom";
+    let fill = "#111";
+
+    // If too close to the top, draw inside the bar instead
+    if (ly < padT + 14) {
+      ly = yTop + 14;
+      baseline = "top";
+      fill = "#0f172a";
+    }
+
+    // Avoid clashing with avg / aim lines
+    const avoidYs = [];
+    if (avgMs != null) avoidYs.push(y(avgMs));
+    if (aimBridgeMs != null) avoidYs.push(y(aimBridgeMs));
+    if (aimStretchMs != null) avoidYs.push(y(aimStretchMs));
+    for (let k = 0; k < avoidYs.length; k++) {
+      if (Math.abs(ly - avoidYs[k]) < 14) {
+        ly = yTop + 14;
+        baseline = "top";
+        fill = "#0f172a";
+        break;
+      }
+    }
+
+    // If the bar is too short, keep label above (inside becomes unreadable)
+    if (barH < 24) {
+      ly = yTop - 6;
+      baseline = "bottom";
+      fill = "#111";
+    }
+
+    // Clamp inside chart area when drawn inside bar
+    if (baseline === "top") {
+      ly = Math.min(ly, yBase - 6);
+    }
+
+    ctx.textBaseline = baseline;
+
+    // small background for readability
+    const lx = x + barW / 2;
+    const metrics = ctx.measureText(label);
+    const tw = metrics.width;
+    const th = 12;
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillRect(lx - tw/2 - 3, ly - th + 2, tw + 6, th + 4);
+
+    ctx.fillStyle = fill;
+    ctx.fillText(label, lx, ly);
+
+    // reset defaults
+    ctx.textAlign = "start";
+    ctx.textBaseline = "alphabetic";
+  }
+}
+
+// ===== Buttons =====
+btnStart.addEventListener("click", startRun);
+btnStop.addEventListener("click", endRun);
+btnUndo.addEventListener("click", undoLast);
+btnExport.addEventListener("click", exportCsv);
+
+if (btnExportAnalytics) {
+  btnExportAnalytics.addEventListener("click", function () {
+    if (!analyticsData || !classRows || classRows.length === 0) {
+      alert("Upload a run CSV first.");
+      return;
+    }
+
+    const rows = [];
+    rows.push([
+      "session_label","reps","rep_distance_m",
+      "tag_id","name","gender","age_group","email","training_band","training_band_display","napfa_band","verify_flag","status",
+      "avg_split","bridge_aim","delta_bridge_sec","stretch_aim","delta_stretch_sec",
+      "pace_gap_sec","fade_sec","total","group"
+    ]);
+
+    for (let i = 0; i < classRows.length; i++) {
+      const r = classRows[i];
+      rows.push([
+        analyticsData.sessionLabel,
+        analyticsData.reps,
+        analyticsData.repDistanceM,
+        r.tagId,
+        r.name,
+        r.genderNorm,
+        r.ageGroup || "",
+        r.email || "",
+        r.trainingBand || "",
+        r.trainingBandDisplay || "",
+        r.napfaBand || "",
+        r.verifyFlag ? "TRUE" : "FALSE",
+        r.status,
+        fmtTime2(r.avgMs),
+        (r.aimBridgeMs != null ? fmtTime2(r.aimBridgeMs) : ""),
+        (r.deltaBridgeSec != null ? Number(r.deltaBridgeSec).toFixed(2) : ""),
+        (r.aimStretchMs != null ? fmtTime2(r.aimStretchMs) : ""),
+        (r.deltaStretchSec != null ? Number(r.deltaStretchSec).toFixed(2) : ""),
+        (r.paceGapSec != null ? Number(r.paceGapSec).toFixed(2) : ""),
+        (r.fadeSec != null ? Number(r.fadeSec).toFixed(2) : ""),
+        (r.totalMs != null ? fmtTime2(r.totalMs) : ""),
+        r.group
+      ]);
+    }
+
+    const csv = makeCsv(rows);
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    // Infer class prefix like 4F04 -> 4F
+    const cls = inferClassPrefixFromTags(classRows.map(r => r.tagId));
+    const label = String(analyticsData.sessionLabel || "Run").replaceAll("×","x").replaceAll(" ","");
+
+    download(`analytics_${cls}_${label}_${stamp}.csv`, csv);
+  });
+}
+
+
+if (analyticsFile) {
+  analyticsFile.addEventListener("change", function (e) {
+    const file = (e.target.files && e.target.files[0]) ? e.target.files[0] : null;
+    if (!file) return;
+
+    file.text().then(function (text) {
+      analyticsData = parseRunCsvForAnalytics(text);
+
+      if (!analyticsData) {
+        if (analyticsSummary) analyticsSummary.textContent =
+          "Could not read this CSV. Please upload the exported run CSV.";
+        return;
+      }
+
+      // Enable class export now that data exists
+      if (btnExportAnalytics) btnExportAnalytics.disabled = false;
+      if (btnPrintClass) btnPrintClass.disabled = false;
+      if (btnSendStudentEmail) btnSendStudentEmail.disabled = false;
+      if (btnSendClassEmails) btnSendClassEmails.disabled = false;
+      setEmailStatus("");
+
+      // Build class rows + render table
+      classRows = buildClassRowsFromAnalytics();
+      renderClassTable();
+
+      // Populate student dropdown (and auto-select first student)
+      if (analyticsStudent) {
+        analyticsStudent.innerHTML = '<option value="">—</option>';
+
+        const keys = Object.keys(analyticsData.byTag).sort();
+        for (let i = 0; i < keys.length; i++) {
+          const tagId = keys[i];
+          const item = analyticsData.byTag[tagId];
+          const opt = document.createElement("option");
+          opt.value = tagId;
+          opt.textContent = item.name + " (" + tagId + ")";
+          analyticsStudent.appendChild(opt);
+        }
+
+        // Auto-pick the first student so the report isn't blank
+        if (keys.length > 0) {
+          if (btnPrintStudent) btnPrintStudent.disabled = true;
+          analyticsStudent.value = keys[0];
+          analyticsStudent.dispatchEvent(new Event("change"));
+        }
+      }
+
+      // Summary
+      if (analyticsSummary) {
+        const distTxt = (analyticsData.repDistanceM && Number(analyticsData.repDistanceM) > 0) ? (" × " + analyticsData.repDistanceM + "m") : "";
+        analyticsSummary.innerHTML =
+          "<b>Loaded:</b> " + analyticsData.sessionLabel +
+          " (" + analyticsData.reps + " reps" + distTxt + ')' +
+          "<br><span style=\"color:#64748b;font-size:12px;\">Build: pc-tiers-20260121a</span>";
+      }
+
+      // Allow re-upload same file
+      analyticsFile.value = "";
+    });
+  });
+}
+
+if (analyticsStudent) {
+  analyticsStudent.addEventListener("change", function () {
+    if (!analyticsData) return;
+    const tagId = analyticsStudent.value;
+    if (!tagId) return;
+
+    const row = analyticsData.byTag[tagId];
+    const stats = computePacingStats(row.splitsMs);
+
+    if (!stats) {
+      if (analyticsSummary) analyticsSummary.textContent = "No split data for this student.";
+      return;
+    }
+
+    // Total time: prefer totalMs from CSV, else sum splits
+    var totalMs = row.totalMs;
+    if (totalMs == null) {
+      var sum = 0;
+      for (var k = 0; k < row.splitsMs.length; k++) {
+        if (row.splitsMs[k] != null) sum += row.splitsMs[k];
+      }
+      totalMs = sum > 0 ? sum : null;
+    }
+    if (analyticsSummary) {
+      analyticsSummary.innerHTML =
+        "<b>" + row.name + "</b><br>" +
+        "<b>Pacing type:</b> " + stats.label +
+        "<br><b>Total time:</b> " + (totalMs != null ? fmtTime2(totalMs) : "—") +
+        "<br><b>Pace gap:</b> " + formatSignedSeconds(stats.paceGapSec, false) + " s (slowest − fastest)" +
+        "<br><b>Fade:</b> " + formatSignedSeconds(stats.fadeSec, true) + " s (last − first)" +
+        "<br><b>Avg split:</b> " + fmtTime2(stats.avg) +
+        "<br><b>Projected 2.4km★:</b> " + ((getClassRow(tagId) && getClassRow(tagId).projected24kMs != null) ? fmtTime2(getClassRow(tagId).projected24kMs) : "—") +
+        "<br><b>Training band:</b> " + ((getClassRow(tagId) && getClassRow(tagId).trainingBandDisplay) ? getClassRow(tagId).trainingBandDisplay : "—") +
+        "<br><b>NAPFA band:</b> " + ((getClassRow(tagId) && getClassRow(tagId).napfaBand) ? getClassRow(tagId).napfaBand : "—") +
+        "<br><b>Fastest / Slowest:</b> " + fmtTime2(stats.min) + " / " + fmtTime2(stats.max);
+    }
+
+    if (splitChart) {
+      const cr = getClassRow(tagId);
+      drawSplitBars(splitChart, row.splitsMs, stats.avg, cr ? cr.aimBridgeMs : null, cr ? cr.aimStretchMs : null);
+    }
+
+  // ===== Fill printable student report =====
+    var group = classifyPacingFromStats(stats);
+    var lines = feedbackLines(group, stats);
+
+    if (reportStudentName) reportStudentName.textContent = row.name || tagId;
+
+    if (reportSessionLine) {
+      var distTxt = (analyticsData.repDistanceM && Number(analyticsData.repDistanceM) > 0)
+        ? (" × " + analyticsData.repDistanceM + "m")
+        : "";
+      reportSessionLine.textContent = (analyticsData.sessionLabel || "Run") + " — " + analyticsData.reps + " reps" + distTxt + (totalMs != null ? (" — Total " + fmtTime2(totalMs)) : "");
+    }
+
+    if (reportPaceGap) reportPaceGap.textContent = formatSignedSeconds(stats.paceGapSec, false) + " s";
+    if (reportFade) reportFade.textContent = formatSignedSeconds(stats.fadeSec, true) + " s";
+    if (reportTotal) reportTotal.textContent = (totalMs != null) ? fmtTime2(totalMs) : "—";
+    if (reportGroup) {
+      const cr2 = getClassRow(tagId);
+      const trainingTxt = cr2 ? (cr2.trainingBandDisplay || cr2.trainingBand || "") : "";
+      const napfaTxt = cr2 ? (cr2.napfaBand || "") : "";
+      const b = trainingTxt && napfaTxt ? `${trainingTxt} • NAPFA ${napfaTxt}` : (trainingTxt || napfaTxt);
+      reportGroup.textContent = b ? (b + " • " + group) : group;
+    }
+
+    if (reportGlow) reportGlow.textContent = lines.glow;
+    if (reportGrowth) reportGrowth.textContent = lines.growth;
+    if (reportNextGoal) reportNextGoal.textContent = lines.nextGoal;
+
+    if (btnPrintStudent) btnPrintStudent.disabled = false;
+    if (btnPrintClass) btnPrintClass.disabled = false;
+  });
+}
+
+function openAnalyticsModal() {
+  if (!analyticsModal) return;
+  analyticsModal.classList.remove("hidden");
+}
+
+function closeAnalyticsModal() {
+  if (!analyticsModal) return;
+  analyticsModal.classList.add("hidden");
+}
+
+// Open button
+if (btnAnalytics) {
+  btnAnalytics.addEventListener("click", function () {
+    openAnalyticsModal();
+  });
+}
+
+// Close button (inside modal)
+if (btnCloseAnalytics) {
+  btnCloseAnalytics.addEventListener("click", function (e) {
+    e.preventDefault();
+    closeAnalyticsModal();
+  });
+}
+
+// Click outside the card closes modal
+if (analyticsModal) {
+  analyticsModal.addEventListener("click", function (e) {
+    if (e.target === analyticsModal) closeAnalyticsModal();
+  });
+}
+
+// Escape key closes modal
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape") closeAnalyticsModal();
+});
+
+// ===== Student Report (Print to PDF) =====
+if (btnPrintStudent) {
+  btnPrintStudent.addEventListener("click", function () {
+    if (!analyticsStudent || !analyticsStudent.value) {
+      alert("Please select a student first.");
+      return;
+    }
+
+    var tagId = analyticsStudent.value;
+    var row = (analyticsData && analyticsData.byTag) ? analyticsData.byTag[tagId] : null;
+    var name = (row && row.name) ? row.name : tagId;
+    var sessionLabel = (analyticsData && analyticsData.sessionLabel) ? analyticsData.sessionLabel : "Run";
+
+    // Helps suggested PDF filename in many browsers
+    document.title = ("RunReport_" + tagId + "_" + name + "_" + sessionLabel).replaceAll(" ", "_");
+
+    window.print(); // choose "Save as PDF"
+  });
+}
+
+// ===== Class Report (Print to PDF) =====
+if (btnPrintClass) {
+  btnPrintClass.addEventListener("click", function () {
+    if (!analyticsData || !analyticsData.byTag) {
+      alert("Please upload a run CSV first.");
+      return;
+    }
+
+    // Ensure bands + aims exist on classRows
+    try {
+      assignBandsByGender(classRows);
+      attachAims(classRows);
+    } catch (e) {}
+
+    const finishedOnly = !!(onlyFinished && onlyFinished.checked);
+    const rows = finishedOnly ? classRows.filter(r => r.status === "FINISHED") : classRows.slice();
+
+    if (!rows.length) {
+      alert("No students to include in the class report.");
+      return;
+    }
+
+    // Sort: Band then Avg split
+    const bandOrder = { "Lead": 1, "Core": 2, "Build": 3, "Verify": 9 };
+    rows.sort(function(a,b){
+      const ao = bandOrder[a.band] || 9;
+      const bo = bandOrder[b.band] || 9;
+      if (ao !== bo) return ao - bo;
+      const av = (a.avgMs == null ? 1e18 : a.avgMs);
+      const bv = (b.avgMs == null ? 1e18 : b.avgMs);
+      return av - bv;
+    });
+
+    const sessionLabel = analyticsData.sessionLabel || "Run";
+    const reps = analyticsData.reps || 0;
+    const dist = analyticsData.repDistanceM || 0;
+
+    // Build HTML
+    const cssPrint = `
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;color:#0f172a;}
+      h1{font-size:18px;margin:0 0 6px;}
+      .meta{color:#475569;margin:0 0 16px;font-size:12px;}
+      .card{border:1px solid #e2e8f0;border-radius:14px;padding:14px 14px 10px;margin:0 0 14px;}
+      .row{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;justify-content:space-between;}
+      .name{font-weight:800;font-size:16px;}
+      .sub{color:#475569;font-size:12px;margin-top:2px;}
+      .chips{display:flex;gap:8px;flex-wrap:wrap;}
+      .chip{display:inline-block;padding:4px 10px;border-radius:999px;background:#f1f5f9;font-size:12px;color:#0f172a;border:1px solid #e2e8f0;}
+      .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px;}
+      .k{color:#475569;font-size:11px;}
+      .v{font-weight:700;}
+      img{width:100%;max-width:760px;border:1px solid #e2e8f0;border-radius:12px;}
+      .fb{margin-top:10px;font-size:12px;color:#0f172a;}
+      .fb b{color:#0f172a;}
+      .page{page-break-after:always;}
+      @media print{ .page:last-child{page-break-after:auto;} }
+    `;
+
+    function makeChartDataUrl(tagId, avgMs) {
+      const src = analyticsData.byTag[tagId];
+      const splitsMs = (src && src.splitsMs) ? src.splitsMs : [];
+      const c = document.createElement("canvas");
+      c.width = 900;
+      c.height = 260;
+      drawSplitBars(c, splitsMs, avgMs, null, null);
+      try { return c.toDataURL("image/png"); } catch(e) { return ""; }
+    }
+
+    function esc(s){ return escapeHtml(String(s||"")); }
+
+    let html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc("ClassReport_"+sessionLabel)}</title><style>${cssPrint}</style></head><body>`;
+    html += `<h1>Class Run Report</h1>`;
+    html += `<div class="meta">${esc(sessionLabel)} • ${reps} reps × ${dist}m • ${finishedOnly ? "Finished only" : "All results"}</div>`;
+
+    for (let i=0;i<rows.length;i++){
+      const r = rows[i];
+      const tagId = r.tagId;
+      const src = analyticsData.byTag[tagId] || {};
+      const stats = computePacingStats(src.splitsMs || []);
+      const group = classifyPacingFromStats(stats);
+      const lines = feedbackLines(group, stats);
+
+      const chartUrl = makeChartDataUrl(tagId, r.avgMs);
+
+      html += `<div class="card page">`;
+      html += `<div class="row"><div>`;
+      html += `<div class="name">${esc(src.name || r.name || tagId)} <span style="color:#94a3b8;font-weight:600;">(${esc(tagId)})</span></div>`;
+      html += `<div class="sub">${esc((src.gender||r.gender||"") ? (src.gender||r.gender) : "")} • Training: <b>${esc(r.trainingBandDisplay || r.trainingBand || "")}</b> • NAPFA: <b>${esc(r.napfaBand || "")}</b> • Status: ${esc(r.status||"")}</div>`;
+      html += `</div><div class="chips">`;
+      if (r.aimBridgeMs != null) html += `<span class="chip">Bridge: ${esc(fmtTime2(r.aimBridgeMs))}</span>`;
+      if (r.aimStretchMs != null) html += `<span class="chip">Stretch: ${esc(fmtTime2(r.aimStretchMs))}</span>`;
+      html += `<span class="chip">${esc(r.group || group || "")}</span>`;
+      html += `</div></div>`;
+
+      html += `<div class="grid">`;
+      html += `<div><div class="k">Avg split</div><div class="v">${esc(fmtTime2(r.avgMs))}</div></div>`;
+      html += `<div><div class="k">Pace gap</div><div class="v">${esc(formatSignedSeconds(r.paceGapSec, false))} s</div></div>`;
+      html += `<div><div class="k">Fade</div><div class="v">${esc(formatSignedSeconds(r.fadeSec, true))} s</div></div>`;
+      html += `</div>`;
+
+      if (chartUrl) html += `<div style="margin-top:10px;"><img src="${chartUrl}" alt="splits chart"></div>`;
+
+      html += `<div class="fb"><b>Glow:</b> ${esc(lines.glow)}<br><b>Growth:</b> ${esc(lines.growth)}<br><b>Next goal:</b> ${esc(lines.nextGoal)}</div>`;
+      html += `</div>`;
+    }
+
+    html += `</body></html>`;
+
+    const w = window.open("", "_blank");
+    if (!w) {
+      alert("Popup blocked. Please allow popups to generate the class PDF.");
+      return;
+    }
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+
+    // Suggested filename
+    w.document.title = ("ClassReport_" + sessionLabel).replaceAll(" ", "_");
+
+    // Give the new window a moment to render images, then print
+    setTimeout(function(){ w.focus(); w.print(); }, 600);
+  });
+}
+
+// ===== Boot =====
+(function boot() {
+  // Preset UI wiring (if present)
+  if (sessionPreset) {
+    sessionPreset.addEventListener("change", updateSessionConfigPreview);
+    if (customReps) customReps.addEventListener("input", updateSessionConfigPreview);
+    if (customDist) customDist.addEventListener("input", updateSessionConfigPreview);
+    updateSessionConfigPreview();
+  }
+
+// Analytics filters (attach ONCE)
+  if (onlyFinished) {
+    onlyFinished.addEventListener("change", function () { renderClassTable(); updateSendClassButtonLabel(); });
+  }
+  if (analyticsAge) {
+    analyticsAge.addEventListener("change", function () {
+      if (analyticsData) {
+        classRows = buildClassRowsFromAnalytics();
+        renderClassTable();
+        if (analyticsStudent && analyticsStudent.value) analyticsStudent.dispatchEvent(new Event("change"));
+      }
+    });
+  }
+  if (bandingMode) {
+    bandingMode.addEventListener("change", function () {
+      renderClassTable();
+      if (analyticsStudent && analyticsStudent.value) analyticsStudent.dispatchEvent(new Event("change"));
+    });
+  }
+
+  // Email UI wiring
+  loadScriptUrl();
+  if (scriptUrlInput) {
+    scriptUrlInput.addEventListener("change", saveScriptUrl);
+    scriptUrlInput.addEventListener("input", saveScriptUrl);
+  }
+  if (btnSendStudentEmail) {
+    btnSendStudentEmail.disabled = true;
+    btnSendStudentEmail.addEventListener("click", sendSelectedStudentEmail);
+  }
+  if (btnSendClassEmails) {
+    btnSendClassEmails.disabled = true;
+    btnSendClassEmails.addEventListener("click", sendClassEmails);
+  }
+  updateSendClassButtonLabel();
+
+  // try load saved roster
+  const saved = localStorage.getItem(ROSTER_STORAGE_KEY);
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved);
+      if (Array.isArray(parsed) && parsed.length) {
+        students = parsed;
+      }
+    } catch (e) {}
+  }
+
+  initSessionData();
+  renderGrid();
+  renderCounters();
+  focusScanInput();
+})();
+
+
+// ===== Run-to-run compare (Format 2) =====
+const compareFileA = document.getElementById("compareFileA");
+const compareFileB = document.getElementById("compareFileB");
+const btnCompareBuild = document.getElementById("btnCompareBuild");
+const btnCompareExportCsv = document.getElementById("btnCompareExportCsv");
+const btnCompareExportJson = document.getElementById("btnCompareExportJson");
+const btnCompareCopyJson = document.getElementById("btnCompareCopyJson");
+const btnComparePreviewJson = document.getElementById("btnComparePreviewJson");
+const compareStudentSelect = document.getElementById("compareStudentSelect");
+const btnCompareCopyStudentJson = document.getElementById("btnCompareCopyStudentJson");
+const btnComparePreviewStudentJson = document.getElementById("btnComparePreviewStudentJson");
+const btnCompareStudentPdfOne = document.getElementById("btnCompareStudentPdfOne");
+const btnFilterAll = document.getElementById("btnFilterAll");
+const btnFilterBuild = document.getElementById("btnFilterBuild");
+const btnFilterCore = document.getElementById("btnFilterCore");
+const btnFilterLead = document.getElementById("btnFilterLead");
+const btnComparePrint = document.getElementById("btnComparePrint");
+const btnCompareStudentPdf = document.getElementById("btnCompareStudentPdf");
+const compareFinishedBothOnly = document.getElementById("compareFinishedBothOnly");
+const compareSummary = document.getElementById("compareSummary");
+
+let compareA = null;
+let compareB = null;
+let compareResult = null;
+let compareBandFilter = "All";
+
+function setCompareHint(msg) {
+  if (compareSummary) compareSummary.textContent = msg;
+}
+
+function tryEnableCompareBuild() {
+  if (btnCompareBuild) btnCompareBuild.disabled = !(compareA && compareB);
+}
+
+function loadCompareFile(file, which) {
+  if (!file) return;
+  file.text().then((text) => {
+    const data = parseRunCsvForAnalytics(text);
+    if (!data) {
+      setCompareHint("Could not read this CSV. Please upload a Running Gate exported run CSV.");
+      return;
+    }
+    if (which === "A") compareA = data;
+    else compareB = data;
+
+    const aLabel = compareA ? (compareA.sessionLabel || "S01") : "—";
+    const bLabel = compareB ? (compareB.sessionLabel || "S02") : "—";
+    setCompareHint(`Loaded: Baseline = ${aLabel} (${compareA ? compareA.reps : "—"}x${compareA ? compareA.repDistanceM : "—"}m), Current = ${bLabel} (${compareB ? compareB.reps : "—"}x${compareB ? compareB.repDistanceM : "—"}m). Click "Build compare".`);
+    tryEnableCompareBuild();
+  });
+}
+
+if (compareFileA) compareFileA.addEventListener("change", (e) => loadCompareFile(e.target.files && e.target.files[0], "A"));
+if (compareFileB) compareFileB.addEventListener("change", (e) => loadCompareFile(e.target.files && e.target.files[0], "B"));
+
+function avgSplitMsFromItem(item, reps) {
+  if (!item) return null;
+  if (item.splitsMs && item.splitsMs.length) {
+    let sum = 0, n = 0;
+    for (let i = 0; i < item.splitsMs.length; i++) {
+      const v = item.splitsMs[i];
+      if (v != null && !Number.isNaN(v)) { sum += v; n++; }
+    }
+    if (n > 0) return sum / n;
+  }
+  if (item.totalMs != null && reps) return item.totalMs / reps;
+  return null;
+}
+
+function buildCompare(a, b) {
+  function msArrayToSecArray(arr){
+    if (!arr || !arr.length) return [];
+    return arr.map(x => (x==null || Number.isNaN(x)) ? null : x/1000);
+  }
+
+  const keysA = a ? Object.keys(a.byTag || {}) : [];
+  const keysB = b ? Object.keys(b.byTag || {}) : [];
+  const setB = new Set(keysB);
+  const keys = keysA.filter(k => setB.has(k)).sort();
+
+  const rows = [];
+  const finishedBothAvgDeltas = [];
+  const finishedBothAvgA = [];
+  const finishedBothAvgB = [];
+
+  for (let i = 0; i < keys.length; i++) {
+    const tagId = keys[i];
+    const ia = a.byTag[tagId];
+    const ib = b.byTag[tagId];
+    const avgAms = avgSplitMsFromItem(ia, a.reps);
+    const avgBms = avgSplitMsFromItem(ib, b.reps);
+    const stA = computePacingStats((ia && ia.splitsMs) ? ia.splitsMs : []);
+    const stB = computePacingStats((ib && ib.splitsMs) ? ib.splitsMs : []);
+    const deltaAvgSec = (avgAms != null && avgBms != null) ? (avgBms - avgAms) / 1000 : null;
+
+    const row = {
+      tag_id: tagId,
+      name: (ib && ib.name) ? ib.name : ((ia && ia.name) ? ia.name : tagId),
+      status_A: ia ? ia.status : "",
+      status_B: ib ? ib.status : "",
+      reps_A: a.reps, dist_A: a.repDistanceM, session_A: a.sessionLabel,
+      reps_B: b.reps, dist_B: b.repDistanceM, session_B: b.sessionLabel,
+      avgSplit_A_s: avgAms != null ? (avgAms/1000) : null,
+      avgSplit_B_s: avgBms != null ? (avgBms/1000) : null,
+      delta_avgSplit_s: deltaAvgSec,
+      paceGap_A_s: stA ? stA.paceGapSec : null,
+      paceGap_B_s: stB ? stB.paceGapSec : null,
+      fade_A_s: stA ? stA.fadeSec : null,
+      fade_B_s: stB ? stB.fadeSec : null,
+      group_A: classifyPacingFromStats(stA),
+      group_B: classifyPacingFromStats(stB),
+      gender: String((ib && ib.gender) || (ia && ia.gender) || "").trim(),
+      age_group: String((ib && ib.age_group) || (ia && ia.age_group) || "").trim(),
+      email: String((ib && ib.email) || (ia && ia.email) || "").trim(),
+      splits_A_s: ia ? msArrayToSecArray(ia.splitsMs || []) : [],
+      splits_B_s: ib ? msArrayToSecArray(ib.splitsMs || []) : []
+    };
+    rows.push(row);
+
+    const finishedBoth = (row.status_A === "FINISHED" && row.status_B === "FINISHED" && row.delta_avgSplit_s != null);
+    if (finishedBoth) {
+      finishedBothAvgDeltas.push(row.delta_avgSplit_s);
+      finishedBothAvgA.push(row.avgSplit_A_s);
+      finishedBothAvgB.push(row.avgSplit_B_s);
+    }
+  }
+
+  return {
+    meta: {
+      baseline: { sessionLabel: a.sessionLabel, reps: a.reps, repDistanceM: a.repDistanceM },
+      current: { sessionLabel: b.sessionLabel, reps: b.reps, repDistanceM: b.repDistanceM },
+      comparedCount: rows.length,
+      finishedBothCount: finishedBothAvgDeltas.length,
+      medianAvgSplit_A_s: median(finishedBothAvgA),
+      medianAvgSplit_B_s: median(finishedBothAvgB),
+      medianDeltaAvgSplit_s: median(finishedBothAvgDeltas)
+    },
+    rows
+  };
+}
+
+function formatSec(sec) {
+  if (sec == null || Number.isNaN(sec)) return "";
+  const m = Math.floor(sec / 60);
+  const s = sec - m*60;
+  return `${String(m).padStart(2,"0")}:${s.toFixed(1).padStart(4,"0")}`;
+}
+
+function projected24kFromAvg(avgSplit_s, repDistanceM) {
+  const d = Number(repDistanceM || 0);
+  if (avgSplit_s == null || Number.isNaN(avgSplit_s) || !d) return null;
+  return avgSplit_s * (2400 / d);
+}
+
+function assignTrainingBandsToCompareRows(compareRes) {
+  if (!compareRes || !compareRes.rows) return;
+  const rows = compareRes.rows;
+
+  const times = rows
+    .filter(r => r.status_B === "FINISHED" && r.avgSplit_B_s != null)
+    .map(r => projected24kFromAvg(r.avgSplit_B_s, r.dist_B))
+    .filter(t => t != null && !Number.isNaN(t))
+    .sort((a,b)=>a-b);
+
+  if (!times.length) return;
+  const p25 = times[Math.floor((times.length-1)*0.25)];
+  const p75 = times[Math.floor((times.length-1)*0.75)];
+
+  compareRes.meta = compareRes.meta || {};
+  compareRes.meta.bandThresholds = { p25_s: p25, p75_s: p75, basis: "current_projected_2.4km_percentiles" };
+
+  rows.forEach(r => {
+    const t = projected24kFromAvg(r.avgSplit_B_s, r.dist_B);
+    if (t==null || Number.isNaN(t)) { r.training_band = ""; return; }
+    if (t <= p25) r.training_band = "Lead";
+    else if (t >= p75) r.training_band = "Build";
+    else r.training_band = "Core";
+
+    const nSplitsB = Array.isArray(r.splits_B_s) ? r.splits_B_s.filter(v => v != null).length : 0;
+    const verifyFlag = r.status_B !== "FINISHED" || nSplitsB < MIN_SPLITS_FOR_BANDING;
+    r.training_band_display = displayBandWithVef(r.training_band, verifyFlag);
+    r.napfa_band = estimateNapfaBand(t * 1000, r.age_group || (analyticsAge ? analyticsAge.value : "16"), r.gender || "");
+  });
+}
+
+function compareToCsv(compareRes) {
+  const headers = [
+    "tag_id","name","gender","age_group","email","training_band","training_band_display","napfa_band",
+    "status_A","status_B","session_A","reps_A","dist_A","avgSplit_A_s","paceGap_A_s","fade_A_s","group_A",
+    "session_B","reps_B","dist_B","avgSplit_B_s","paceGap_B_s","fade_B_s","group_B",
+    "delta_avgSplit_s"
+  ];
+  const lines = [headers.join(",")];
+  const rows = compareRes.rows || [];
+  for (let i=0;i<rows.length;i++){
+    const x = rows[i];
+    const vals = headers.map(h => {
+      const v = x[h];
+      if (v == null) return "";
+      if (typeof v === "number") return String(Number(v.toFixed ? v.toFixed(3) : v));
+      return String(v).replace(/"/g,'""');
+    });
+    const safe = vals.map(v => (/[,\n"]/.test(v) ? `"${v}"` : v));
+    lines.push(safe.join(","));
+  }
+  return lines.join("\n");
+}
+
+function pickMainFocus(fade_s, gap_s, status) {
+  if (status !== "FINISHED") return "Base";
+  if (fade_s != null && fade_s >= 10) return "Tempo";
+  if (gap_s != null && gap_s >= 8) return "Pacing";
+  return "Intervals";
+}
+
+function buildTwoWeekPlan(focus, repDistanceM) {
+  const rep = repDistanceM ? `${repDistanceM}m` : "rep";
+  if (focus === "Base") {
+    return [
+      `Session 1: 15–20 min easy jog/walk (RPE 5–6).`,
+      `Session 2: 6 × ${rep} easy (RPE 6) with 1–2 min walk.`
+    ];
+  }
+  if (focus === "Tempo") {
+    return [
+      `Session 1: 10 min easy + 8 min steady (RPE 7) + 5 min easy.`,
+      `Session 2: 4 × ${rep} steady (RPE 7) with equal rest.`
+    ];
+  }
+  if (focus === "Pacing") {
+    return [
+      `Session 1: 6 × ${rep} aiming for even splits (same time each rep).`,
+      `Session 2: 3 × ${rep} negative split (2nd half slightly faster).`
+    ];
+  }
+  return [
+    `Session 1: 6 × ${rep} hard (RPE 8–9) with 2–3 min rest.`,
+    `Session 2: 8 × ${rep} controlled fast (RPE 8) with 90s rest.`
+  ];
+}
+
+function compareToStudentJson(compareRes) {
+  const rows = compareRes.rows || [];
+  const meta = compareRes.meta || {};
+  const base = meta.baseline || {};
+  const cur = meta.current || {};
+
+  const out = {
+    schema_version: "2.1",
+    generated_at: new Date().toISOString(),
+    context: {
+      school: "",
+      class_code: "",
+      sport: "run",
+      test_type: "reps",
+      rep_distance_m: cur.repDistanceM || base.repDistanceM || null,
+      compare_mode: "S01_vs_S02",
+      baseline: { session_id: base.sessionLabel || "S01", date: "", reps_planned: base.reps || null },
+      current: { session_id: cur.sessionLabel || "S02", date: "", reps_planned: cur.reps || null }
+    },
+    summary: {
+      students_total: rows.length,
+      students_compared: rows.length,
+      students_finished_both: rows.filter(r=>r.status_A==="FINISHED" && r.status_B==="FINISHED" && r.delta_avgSplit_s!=null).length,
+      median: {
+        avg_split_s_baseline: median(rows.filter(r=>r.avgSplit_A_s!=null).map(r=>r.avgSplit_A_s)),
+        avg_split_s_current: median(rows.filter(r=>r.avgSplit_B_s!=null).map(r=>r.avgSplit_B_s)),
+        delta_avg_split_s: median(rows.filter(r=>r.delta_avgSplit_s!=null).map(r=>r.delta_avgSplit_s))
+      }
+    },
+    students: []
+  };
+
+  for (const r of rows) {
+    const projA = projected24kFromAvg(r.avgSplit_A_s, r.dist_A);
+    const projB = projected24kFromAvg(r.avgSplit_B_s, r.dist_B);
+    const focus = pickMainFocus(r.fade_B_s, r.paceGap_B_s, r.status_B);
+    const delta = r.delta_avgSplit_s;
+    const plan = buildTwoWeekPlan(focus, r.dist_B);
+
+    out.students.push({
+      student: {
+        tag_id: r.tag_id,
+        name: r.name,
+        gender: String(r.gender || "").trim().toUpperCase(),
+        age_group: r.age_group || (analyticsAge ? analyticsAge.value : "16")
+      },
+      bands: {
+        training_band: r.training_band || "",
+        training_band_display: r.training_band_display || "",
+        napfa_band: r.napfa_band || ""
+      },
+      baseline: {
+        session_id: r.session_A,
+        rep_distance_m: r.dist_A,
+        reps_expected: r.reps_A,
+        status: r.status_A,
+        splits_s: r.splits_A_s || [],
+        metrics: { avg_split_s: r.avgSplit_A_s, pace_gap_s: r.paceGap_A_s, fade_s: r.fade_A_s, projected_2_4km_s: projA },
+        pacing: { group_label: r.group_A || "" }
+      },
+      current: {
+        session_id: r.session_B,
+        rep_distance_m: r.dist_B,
+        reps_expected: r.reps_B,
+        status: r.status_B,
+        splits_s: r.splits_B_s || [],
+        metrics: { avg_split_s: r.avgSplit_B_s, pace_gap_s: r.paceGap_B_s, fade_s: r.fade_B_s, projected_2_4km_s: projB },
+        pacing: { group_label: r.group_B || "" }
+      },
+      delta: {
+        avg_split_s: delta,
+        projected_2_4km_s: (projA!=null && projB!=null) ? (projB - projA) : null,
+        pace_gap_s: (r.paceGap_A_s!=null && r.paceGap_B_s!=null) ? (r.paceGap_B_s - r.paceGap_A_s) : null,
+        fade_s: (r.fade_A_s!=null && r.fade_B_s!=null) ? (r.fade_B_s - r.fade_A_s) : null,
+        direction: (delta==null) ? "no_data" : (delta<0 ? "improved" : (delta>0 ? "slower" : "same"))
+      },
+      coach_payload: {
+        main_focus: focus,
+        next_mini_goal: (r.paceGap_B_s != null && r.paceGap_B_s >= 8) ? "Try to keep every rep within 5 seconds of each other." : "Aim for a small negative split: last rep 1–3s faster than first rep.",
+        reflection_q: "What helped you keep going when it got hard — and what will you do earlier next time?",
+        two_week_plan: [
+          { week: 1, session: 1, workout: plan[0] },
+          { week: 1, session: 2, workout: plan[1] },
+          { week: 2, session: 1, workout: plan[0] },
+          { week: 2, session: 2, workout: plan[1] }
+        ]
+      }
+    });
+  }
+
+  return JSON.stringify(out, null, 2);
+}
+
+function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      resolve();
+    } catch (e) { reject(e); }
+  });
+}
+
+function openJsonPreview(jsonText, title="Student Summary JSON") {
+  const w = window.open("", "_blank");
+  if (!w) return;
+  const escaped = jsonText.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  w.document.open();
+  w.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+  <style>body{font-family:ui-monospace,monospace;margin:16px;} pre{white-space:pre-wrap;word-break:break-word;border:1px solid #e5e7eb;border-radius:12px;padding:12px;background:#fafafa;}</style>
+  </head><body><pre>${escaped}</pre></body></html>`);
+  w.document.close();
+}
+
+function printTeacherCompare(compareRes, a, b) {
+  const rows = compareRes.rows || [];
+  const improvers = rows
+    .filter(r => r.status_A==="FINISHED" && r.status_B==="FINISHED" && r.delta_avgSplit_s != null)
+    .slice()
+    .sort((x,y)=>x.delta_avgSplit_s-y.delta_avgSplit_s)
+    .slice(0,5);
+
+  const med = compareRes.meta && compareRes.meta.medianDeltaAvgSplit_s != null
+    ? `${compareRes.meta.medianDeltaAvgSplit_s >= 0 ? "+" : ""}${compareRes.meta.medianDeltaAvgSplit_s.toFixed(1)}s`
+    : "—";
+
+  let body = `<!doctype html><html><head><meta charset="utf-8"><title>Teacher Compare</title>
+  <style>body{font-family:system-ui,Arial,sans-serif;margin:20px;} .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:12px 0;} table{border-collapse:collapse;width:100%;font-size:12px;} th,td{border:1px solid #e5e7eb;padding:6px;} th{background:#f8fafc;} </style>
+  </head><body>`;
+  body += `<h1>Teacher Compare</h1>`;
+  body += `<div>${escapeHtml(a.sessionLabel || "S01")} vs ${escapeHtml(b.sessionLabel || "S02")} • Median Δ avg split: ${med}</div>`;
+  body += `<div class="card"><h3>Top improvers</h3><ol>${improvers.map(r => `<li>${escapeHtml(r.name)} (${escapeHtml(r.tag_id)}) — ${r.delta_avgSplit_s.toFixed(1)}s</li>`).join("")}</ol></div>`;
+  body += `<table><thead><tr><th>Name</th><th>Tag</th><th>Training</th><th>NAPFA</th><th>S01 avg</th><th>S02 avg</th><th>Δ avg</th><th>S02 gap</th><th>S02 fade</th><th>Status A</th><th>Status B</th></tr></thead><tbody>`;
+  for (const r of rows) {
+    body += `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.tag_id)}</td><td>${escapeHtml(r.training_band_display || r.training_band || "")}</td><td>${escapeHtml(r.napfa_band || "")}</td><td>${formatSec(r.avgSplit_A_s)}</td><td>${formatSec(r.avgSplit_B_s)}</td><td>${r.delta_avgSplit_s == null ? "" : r.delta_avgSplit_s.toFixed(1)}</td><td>${r.paceGap_B_s == null ? "" : r.paceGap_B_s.toFixed(1)}</td><td>${r.fade_B_s == null ? "" : r.fade_B_s.toFixed(1)}</td><td>${escapeHtml(r.status_A)}</td><td>${escapeHtml(r.status_B)}</td></tr>`;
+  }
+  body += `</tbody></table><script>window.onload=()=>setTimeout(()=>window.print(),250);</script></body></html>`;
+  const w = window.open("", "_blank");
+  if (!w) return;
+  w.document.open(); w.document.write(body); w.document.close();
+}
+
+function printStudentFeedbackPack(compareRes, finishedBothOnly=true) {
+  const rows = (compareRes && compareRes.rows) ? compareRes.rows : [];
+  const filtered = finishedBothOnly
+    ? rows.filter(r => r.status_A==="FINISHED" && r.status_B==="FINISHED" && r.avgSplit_A_s!=null && r.avgSplit_B_s!=null)
+    : rows.slice();
+
+  const today = new Date().toLocaleDateString();
+  let html = `<!doctype html><html><head><meta charset="utf-8"><title>Student Feedback Pack</title>
+  <style>@page { size:A4; margin:14mm; } body{font-family:system-ui,Arial,sans-serif;} .page{page-break-after:always;} .box{border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;margin:10px 0;} .title{font-weight:800;font-size:16px;color:#0B5394;} .sub{color:#475569;font-size:11px;} .grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px;font-size:12px;} </style>
+  </head><body>`;
+  for (const r of filtered) {
+    const projB = projected24kFromAvg(r.avgSplit_B_s, r.dist_B);
+    const focus = pickMainFocus(r.fade_B_s, r.paceGap_B_s, r.status_B);
+    const plan = buildTwoWeekPlan(focus, r.dist_B);
+    html += `<section class="page"><div class="title">Pace Coach – Student Feedback</div><div class="sub">Baseline: ${escapeHtml(r.session_A || "")} • Current: ${escapeHtml(r.session_B || "")} • Generated: ${today}</div>`;
+    html += `<div class="box"><b>${escapeHtml(r.name || "")}</b> (${escapeHtml(r.tag_id || "")}) • Training: ${escapeHtml(r.training_band_display || r.training_band || "")} • NAPFA: ${escapeHtml(r.napfa_band || "")}</div>`;
+    html += `<div class="box"><div class="grid2"><div><b>S01 avg split:</b> ${formatSec(r.avgSplit_A_s)}</div><div><b>S02 avg split:</b> ${formatSec(r.avgSplit_B_s)}</div><div><b>Δ avg split:</b> ${r.delta_avgSplit_s == null ? "—" : ((r.delta_avgSplit_s>=0?"+":"") + r.delta_avgSplit_s.toFixed(1) + "s")}</div><div><b>Projected 2.4km:</b> ${projB != null ? fmtTime2(projB*1000) : "—"}</div><div><b>Pace gap:</b> ${r.paceGap_B_s == null ? "—" : r.paceGap_B_s.toFixed(1)+"s"}</div><div><b>Fade:</b> ${r.fade_B_s == null ? "—" : ((r.fade_B_s>=0?"+":"") + r.fade_B_s.toFixed(1)+"s")}</div><div><b>Pacing group:</b> ${escapeHtml(r.group_B || "")}</div><div><b>Status:</b> ${escapeHtml(r.status_B || "")}</div></div></div>`;
+    html += `<div class="box"><b>Main focus:</b> ${focus}</div>`;
+    html += `<div class="box"><b>2-week plan</b><ol><li>${escapeHtml(plan[0])}</li><li>${escapeHtml(plan[1])}</li><li>Repeat the same two sessions next week.</li></ol></div>`;
+    html += `<div class="box"><b>Reflection:</b> What helped you keep going when it got hard — and what will you do earlier next time?</div></section>`;
+  }
+  html += `<script>window.onload=()=>setTimeout(()=>window.print(),250);</script></body></html>`;
+  const w = window.open("", "_blank");
+  if (!w) return;
+  w.document.open(); w.document.write(html); w.document.close();
+}
+
+function compareToStudentJsonOne(compareRes, tagId) {
+  const full = JSON.parse(compareToStudentJson(compareRes));
+  const one = full.students.find(s => s.student && s.student.tag_id === tagId);
+  if (!one) return JSON.stringify(full, null, 2);
+  full.summary.students_total = 1;
+  full.summary.students_compared = 1;
+  full.summary.students_finished_both = (one.current && one.current.status === "FINISHED" && one.baseline && one.baseline.status === "FINISHED") ? 1 : 0;
+  full.students = [one];
+  return JSON.stringify(full, null, 2);
+}
+
+function getSelectedCompareRow() {
+  if (!compareStudentSelect) return null;
+  const tagId = compareStudentSelect.value;
+  if (!tagId || !compareResult || !compareResult.rows) return null;
+  return compareResult.rows.find(r => r.tag_id === tagId) || null;
+}
+
+function populateCompareStudentSelect() {
+  if (!compareStudentSelect || !compareResult || !compareResult.rows) return;
+  const onlyFinishedBoth = compareFinishedBothOnly ? compareFinishedBothOnly.checked : true;
+  const rows = onlyFinishedBoth
+    ? compareResult.rows.filter(r => r.status_A==="FINISHED" && r.status_B==="FINISHED" && r.avgSplit_A_s!=null && r.avgSplit_B_s!=null)
+    : compareResult.rows.slice();
+  const bandFiltered = (compareBandFilter && compareBandFilter !== "All")
+    ? rows.filter(r => (r.training_band || "") === compareBandFilter)
+    : rows;
+
+  const prev = compareStudentSelect.value;
+  compareStudentSelect.innerHTML = '<option value="">— Select —</option>';
+  bandFiltered.slice().sort((a,b) => String(a.tag_id).localeCompare(String(b.tag_id))).forEach(r => {
+    const opt = document.createElement("option");
+    opt.value = r.tag_id;
+    opt.textContent = `${r.name || ""} (${r.tag_id})`;
+    compareStudentSelect.appendChild(opt);
+  });
+
+  if (prev && bandFiltered.some(r=>r.tag_id===prev)) compareStudentSelect.value = prev;
+  const hasSel = !!compareStudentSelect.value;
+  if (btnCompareCopyStudentJson) btnCompareCopyStudentJson.disabled = !hasSel;
+  if (btnComparePreviewStudentJson) btnComparePreviewStudentJson.disabled = !hasSel;
+  if (btnCompareStudentPdfOne) btnCompareStudentPdfOne.disabled = !hasSel;
+}
+
+function setBandFilter(val) {
+  compareBandFilter = val || "All";
+  const map = { All: btnFilterAll, Build: btnFilterBuild, Core: btnFilterCore, Lead: btnFilterLead };
+  Object.values(map).forEach(b => { if (b) b.classList.remove("active"); });
+  const btn = map[compareBandFilter];
+  if (btn) btn.classList.add("active");
+  populateCompareStudentSelect();
+}
+
+if (btnFilterAll) btnFilterAll.addEventListener("click", () => setBandFilter("All"));
+if (btnFilterBuild) btnFilterBuild.addEventListener("click", () => setBandFilter("Build"));
+if (btnFilterCore) btnFilterCore.addEventListener("click", () => setBandFilter("Core"));
+if (btnFilterLead) btnFilterLead.addEventListener("click", () => setBandFilter("Lead"));
+
+if (compareFinishedBothOnly) compareFinishedBothOnly.addEventListener("change", populateCompareStudentSelect);
+if (compareStudentSelect) compareStudentSelect.addEventListener("change", () => {
+  const hasSel = !!compareStudentSelect.value;
+  if (btnCompareCopyStudentJson) btnCompareCopyStudentJson.disabled = !hasSel;
+  if (btnComparePreviewStudentJson) btnComparePreviewStudentJson.disabled = !hasSel;
+  if (btnCompareStudentPdfOne) btnCompareStudentPdfOne.disabled = !hasSel;
+});
+
+if (btnCompareBuild) btnCompareBuild.addEventListener("click", () => {
+  if (!(compareA && compareB)) return;
+  compareResult = buildCompare(compareA, compareB);
+  assignTrainingBandsToCompareRows(compareResult);
+  const m = compareResult.meta;
+  const med = (m.medianDeltaAvgSplit_s != null) ? `${m.medianDeltaAvgSplit_s >= 0 ? "+" : ""}${m.medianDeltaAvgSplit_s.toFixed(1)}s` : "—";
+  setCompareHint(`Compared ${m.comparedCount} students (FINISHED both: ${m.finishedBothCount}). Median Δ avg split (FINISHED both): ${med}.`);
+  if (btnCompareExportCsv) btnCompareExportCsv.disabled = false;
+  if (btnCompareExportJson) btnCompareExportJson.disabled = false;
+  if (btnComparePrint) btnComparePrint.disabled = false;
+  if (btnCompareStudentPdf) btnCompareStudentPdf.disabled = false;
+  if (btnCompareCopyJson) btnCompareCopyJson.disabled = false;
+  if (btnComparePreviewJson) btnComparePreviewJson.disabled = false;
+  if (compareStudentSelect) compareStudentSelect.disabled = false;
+  if (btnFilterAll) btnFilterAll.disabled = false;
+  if (btnFilterBuild) btnFilterBuild.disabled = false;
+  if (btnFilterCore) btnFilterCore.disabled = false;
+  if (btnFilterLead) btnFilterLead.disabled = false;
+  populateCompareStudentSelect();
+});
+
+if (btnCompareExportCsv) btnCompareExportCsv.addEventListener("click", () => {
+  if (!compareResult) return;
+  const a = compareResult.meta.baseline;
+  const b = compareResult.meta.current;
+  const name = `RunToRun_${a.sessionLabel || "S01"}_vs_${b.sessionLabel || "S02"}.csv`;
+  download(name, compareToCsv(compareResult));
+});
+
+if (btnCompareExportJson) btnCompareExportJson.addEventListener("click", () => {
+  if (!compareResult) return;
+  const a = compareResult.meta.baseline;
+  const b = compareResult.meta.current;
+  const name = `StudentSummary_v2_${a.sessionLabel || "S01"}_vs_${b.sessionLabel || "S02"}.json`;
+  const blob = new Blob([compareToStudentJson(compareResult)], { type: "application/json;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const aEl = document.createElement("a");
+  aEl.href = url;
+  aEl.download = name;
+  document.body.appendChild(aEl);
+  aEl.click();
+  aEl.remove();
+  URL.revokeObjectURL(url);
+});
+
+if (btnCompareCopyJson) btnCompareCopyJson.addEventListener("click", async () => {
+  if (!compareResult) return;
+  try {
+    await copyTextToClipboard(compareToStudentJson(compareResult));
+    alert("Copied JSON to clipboard ✅");
+  } catch (e) {
+    alert("Could not copy automatically. Try Preview JSON instead.");
+  }
+});
+
+if (btnComparePreviewJson) btnComparePreviewJson.addEventListener("click", () => {
+  if (!compareResult) return;
+  openJsonPreview(compareToStudentJson(compareResult), "Student Summary JSON (v2)");
+});
+
+if (btnComparePrint) btnComparePrint.addEventListener("click", () => {
+  if (!compareResult || !(compareA && compareB)) return;
+  printTeacherCompare(compareResult, compareA, compareB);
+});
+
+if (btnCompareStudentPdf) btnCompareStudentPdf.addEventListener("click", () => {
+  if (!compareResult) return;
+  const only = compareFinishedBothOnly ? compareFinishedBothOnly.checked : true;
+  printStudentFeedbackPack(compareResult, only);
+});
+
+if (btnCompareCopyStudentJson) btnCompareCopyStudentJson.addEventListener("click", async () => {
+  const row = getSelectedCompareRow();
+  if (!row || !compareResult) return;
+  try {
+    await copyTextToClipboard(compareToStudentJsonOne(compareResult, row.tag_id));
+    alert(`Copied JSON for ${row.tag_id} ✅`);
+  } catch (e) {
+    alert("Could not copy automatically. Try Preview Selected JSON instead.");
+  }
+});
+
+if (btnComparePreviewStudentJson) btnComparePreviewStudentJson.addEventListener("click", () => {
+  const row = getSelectedCompareRow();
+  if (!row || !compareResult) return;
+  openJsonPreview(compareToStudentJsonOne(compareResult, row.tag_id), `Student Summary JSON (${row.tag_id})`);
+});
+
+if (btnCompareStudentPdfOne) btnCompareStudentPdfOne.addEventListener("click", () => {
+  const row = getSelectedCompareRow();
+  if (!row || !compareResult) return;
+  const oneRes = { ...compareResult, rows: [row] };
+  printStudentFeedbackPack(oneRes, false);
+});
