@@ -63,6 +63,8 @@ button.secondary { font-weight: 700; }
 .hintRow.small { font-size: 12px; color: #444; }
 .fileLabel { display: flex; gap: 8px; align-items: center; font-weight: 800; }
 .warn { margin-left: 10px; color: #b45309; font-weight: 900; }
+.auditIndicator { font-size: 12px; font-weight: 800; color: #334155; }
+.persistWarn { color: #b91c1c; font-weight: 900; }
 
 .grid {
   margin-top: 12px;
@@ -664,6 +666,10 @@ button.big {
         <div class="hintRow small">
           CSV headers must be: <code>tagId,name</code> (optional: <code>gender,age_group,email</code>)
         </div>
+        <div class="hintRow small auditIndicator">
+          RFID audit: total <span id="auditTotal">0</span> • accepted <span id="auditAccepted">0</span> • debounced <span id="auditDebounced">0</span> • too soon <span id="auditTooSoon">0</span> • unknown <span id="auditUnknown">0</span> • malformed <span id="auditMalformed">0</span>
+          <span id="persistenceWarn" class="persistWarn hidden">Event persistence failed — in-memory audit only.</span>
+        </div>
       </div>
 
       <div id="grid" class="grid"></div>
@@ -889,6 +895,17 @@ const ROSTER_STORAGE_KEY = "runTimingRosterV1";
 const SESSION_STORAGE_KEY = "runTimingSessionV2Stage1";
 const SESSION_STORAGE_SCHEMA_VERSION = 1;
 const SESSION_RECOVERY_MAX_WALL_GAP_MS = 12 * 60 * 60 * 1000; // 12 hours
+const RFID_PARTIAL_TIMEOUT_MS = 1500;
+const RFID_SOURCE = "RFID_KEYBOARD";
+const RFID_STATUSES = {
+  ACCEPTED: "ACCEPTED",
+  DEBOUNCED: "DEBOUNCED",
+  TOO_SOON: "TOO_SOON",
+  UNKNOWN_TAG: "UNKNOWN_TAG",
+  MALFORMED: "MALFORMED",
+  ALREADY_FINISHED: "ALREADY_FINISHED",
+  SESSION_NOT_STARTED: "SESSION_NOT_STARTED",
+};
 
 // ===== Session preset support =====
 const DEFAULT_SESSION = { label: "3 × 800m", reps: 3, repDistanceM: 800 };
@@ -921,6 +938,9 @@ let session = {
   timerHandle: null,
   lastActionStack: [],     // for UNDO
   dataById: new Map(),     // id -> { splits: [ms], lastScanAtPerf }
+  rawHardwareEvents: [],    // immutable RFID keyboard captures with post-processing outcome fields
+  rawEventCounter: 0,
+  persistenceFailed: false,
 };
 
 function initSessionData() {
@@ -986,6 +1006,34 @@ function makeSessionId() {
   return `sess_${stamp}_${rand}`;
 }
 
+function makeRawHardwareEventId(capturedWallTimeIso) {
+  session.rawEventCounter += 1;
+  const stamp = String(capturedWallTimeIso || new Date().toISOString()).replace(/[^0-9A-Za-z]/g, "");
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `rfid_${stamp}_${session.rawEventCounter}_${rand}`;
+}
+
+function cloneRawHardwareEvents(events) {
+  return Array.isArray(events) ? events.map(e => ({ ...e })) : [];
+}
+
+function setPersistenceWarning(show) {
+  session.persistenceFailed = !!show;
+  if (elPersistenceWarn) elPersistenceWarn.classList.toggle("hidden", !show);
+}
+
+function renderAuditIndicator() {
+  const events = Array.isArray(session.rawHardwareEvents) ? session.rawHardwareEvents : [];
+  const count = (status) => events.filter(e => e.processing_status === status).length;
+  if (elAuditTotal) elAuditTotal.textContent = String(events.length);
+  if (elAuditAccepted) elAuditAccepted.textContent = String(count(RFID_STATUSES.ACCEPTED));
+  if (elAuditDebounced) elAuditDebounced.textContent = String(count(RFID_STATUSES.DEBOUNCED));
+  if (elAuditTooSoon) elAuditTooSoon.textContent = String(count(RFID_STATUSES.TOO_SOON));
+  if (elAuditUnknown) elAuditUnknown.textContent = String(count(RFID_STATUSES.UNKNOWN_TAG));
+  if (elAuditMalformed) elAuditMalformed.textContent = String(count(RFID_STATUSES.MALFORMED));
+  if (elPersistenceWarn) elPersistenceWarn.classList.toggle("hidden", !session.persistenceFailed);
+}
+
 function serializeSessionDataById() {
   const out = {};
   session.dataById.forEach((d, id) => {
@@ -1036,6 +1084,7 @@ function buildSessionSnapshot(status) {
     sessionConfig: { ...sessionConfig },
     students: students.map(s => ({ ...s })),
     dataById: serializeSessionDataById(),
+    rawHardwareEvents: cloneRawHardwareEvents(session.rawHardwareEvents),
     lastActionStack: session.lastActionStack.map(a => ({ ...a })),
     ui: {
       elapsedText: elElapsed ? elElapsed.textContent : "",
@@ -1049,11 +1098,15 @@ function buildSessionSnapshot(status) {
 
 function saveSessionSnapshot(status) {
   try {
-    if (!session.sessionId && !session.started && session.dataById.size === 0) return;
+    if (!session.sessionId && !session.started && session.dataById.size === 0 && session.rawHardwareEvents.length === 0) return;
     const snapshot = buildSessionSnapshot(status);
     localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+    setPersistenceWarning(false);
+    return true;
   } catch (e) {
-    pushFeedItem(`<b>Warning</b>: could not save session recovery data.`);
+    setPersistenceWarning(true);
+    pushFeedItem(`<b>Warning</b>: event/session recovery data was not saved. In-memory data is still available.`);
+    return false;
   }
 }
 
@@ -1122,6 +1175,9 @@ function applyRecoveredSessionSnapshot(snapshot) {
   session.endedElapsedMs = Number.isFinite(Number(snapshot.session.endedElapsedMs)) ? Number(snapshot.session.endedElapsedMs) : (session.started ? null : elapsedMsAtSave);
   session.startPerf = session.started ? (performance.now() - restoredElapsedMs) : null;
   session.lastActionStack = Array.isArray(snapshot.lastActionStack) ? snapshot.lastActionStack.map(a => ({ ...a })) : [];
+  session.rawHardwareEvents = cloneRawHardwareEvents(snapshot.rawHardwareEvents);
+  session.rawEventCounter = session.rawHardwareEvents.length;
+  session.persistenceFailed = false;
   restoreDataById(snapshot.dataById);
 
   if (sessionPreset && snapshot.ui && snapshot.ui.sessionPresetValue) sessionPreset.value = snapshot.ui.sessionPresetValue;
@@ -1149,6 +1205,7 @@ function applyRecoveredSessionSnapshot(snapshot) {
 
   renderGrid();
   renderCounters();
+  renderAuditIndicator();
   pushFeedItem(`<b>Recovered</b>: ${snapshot.status === "ACTIVE" ? "active" : "completed"} session ${sessionConfig.label}`);
   saveSessionSnapshot(snapshot.status === "ACTIVE" ? "ACTIVE" : "COMPLETED");
   focusScanInput();
@@ -1183,6 +1240,13 @@ const elFeed = document.getElementById("feed");
 const elScanInput = document.getElementById("scanInput");
 const elFocusWarn = document.getElementById("focusWarn");
 const elRosterCount = document.getElementById("rosterCount");
+const elAuditTotal = document.getElementById("auditTotal");
+const elAuditAccepted = document.getElementById("auditAccepted");
+const elAuditDebounced = document.getElementById("auditDebounced");
+const elAuditTooSoon = document.getElementById("auditTooSoon");
+const elAuditUnknown = document.getElementById("auditUnknown");
+const elAuditMalformed = document.getElementById("auditMalformed");
+const elPersistenceWarn = document.getElementById("persistenceWarn");
 
 const btnStart = document.getElementById("btnStart");
 const btnStop = document.getElementById("btnStop");
@@ -1400,24 +1464,24 @@ function pushFeedItem(msg) {
 
 // ===== Core logic =====
 function recordPassByStudentId(studentId, { source, rawTagId } = {}) {
-  if (!session.started) return;
+  if (!session.started) return { status: RFID_STATUSES.SESSION_NOT_STARTED, reason: "Session is not started.", acceptedSplitIndex: null };
 
   const target = getTargetPasses();
 
   const s = students.find(x => x.id === studentId);
   const d = session.dataById.get(studentId);
-  if (!s || !d) return;
+  if (!s || !d) return { status: RFID_STATUSES.UNKNOWN_TAG, reason: "Student not found in current session data.", acceptedSplitIndex: null };
 
   if (d.splits.length >= target) {
     pushFeedItem(`<b>Ignored</b>: ${s.name} already finished.`);
-    return;
+    return { status: RFID_STATUSES.ALREADY_FINISHED, reason: "Runner already completed required passes.", acceptedSplitIndex: null };
   }
 
 const perfNow = performance.now();
 if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
   const srcLabel = (source == null || source === "") ? "input" : source;
   pushFeedItem(`<b>Ignored</b>: ${s.name} (double ${srcLabel})`);
-  return;
+  return { status: RFID_STATUSES.DEBOUNCED, reason: `Same runner scanned within ${ANTI_DOUBLE_MS} ms.`, acceptedSplitIndex: null };
 }
 
   const elapsed = nowElapsedMs();
@@ -1428,7 +1492,7 @@ if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
     pushFeedItem(`<b>Too soon</b>: ${s.name} (${fmtTime(elapsed - prev)} since last) — ignored`);
     d.lastScanAtPerf = perfNow;
     saveSessionSnapshot("ACTIVE");
-    return;
+    return { status: RFID_STATUSES.TOO_SOON, reason: `Elapsed since last split was below ${minLapMs} ms minimum.`, acceptedSplitIndex: null };
   }
 
   const beforeLen = d.splits.length;
@@ -1448,18 +1512,68 @@ if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
   pushFeedItem(`<b>${label}</b> — ${s.name} — ${fmtTime(elapsed)} <span style="color:#555">(${srcLabel2})</span>`);
   renderGrid();
   saveSessionSnapshot("ACTIVE");
+  return { status: RFID_STATUSES.ACCEPTED, reason: "Accepted by existing split logic.", acceptedSplitIndex: beforeLen };
+}
+
+function createRawHardwareEvent(originalValue, capture) {
+  const capturedWallTimeIso = capture && capture.wallTimeIso ? capture.wallTimeIso : new Date().toISOString();
+  const capturedPerfMs = capture && Number.isFinite(capture.perfMs) ? capture.perfMs : performance.now();
+  return {
+    event_id: makeRawHardwareEventId(capturedWallTimeIso),
+    session_id: session.sessionId || null,
+    source: RFID_SOURCE,
+    captured_wall_time_iso: capturedWallTimeIso,
+    captured_perf_ms: capturedPerfMs,
+    elapsed_ms_from_session_start: session.started && Number.isFinite(session.startPerf) ? Math.max(0, capturedPerfMs - session.startPerf) : null,
+    original_tag_value: String(originalValue),
+    normalized_tag_value: String(originalValue).trim(),
+    student_id: null,
+    processing_status: null,
+    processing_reason: null,
+    accepted_split_index: null,
+  };
+}
+
+function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSplitIndex) {
+  event.student_id = studentId || null;
+  event.processing_status = status;
+  event.processing_reason = reason || "";
+  event.accepted_split_index = Number.isInteger(acceptedSplitIndex) ? acceptedSplitIndex : null;
+  session.rawHardwareEvents.push(event);
+  renderAuditIndicator();
+  saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
+}
+
+function recordRfidKeyboardEvent(originalValue, capture) {
+  const event = createRawHardwareEvent(originalValue, capture);
+  const clean = event.normalized_tag_value;
+
+  if (!/^\d{4}$/.test(clean)) {
+    pushFeedItem(`<b>Malformed RFID</b>: ${clean || "(empty)"}`);
+    finalizeRawHardwareEvent(event, RFID_STATUSES.MALFORMED, "RFID value was not exactly four numeric characters.", null, null);
+    return;
+  }
+
+  if (!session.started) {
+    pushFeedItem(`<b>Ignored scan</b>: ${clean} before session start.`);
+    finalizeRawHardwareEvent(event, RFID_STATUSES.SESSION_NOT_STARTED, "Session was not started when scan was captured.", null, null);
+    return;
+  }
+
+  const s = students.find(x => String(x.tagId) === clean);
+  if (!s) {
+    pushFeedItem(`<b>Unknown tag</b>: ${clean}`);
+    finalizeRawHardwareEvent(event, RFID_STATUSES.UNKNOWN_TAG, "Tag was not found in the roster.", null, null);
+    return;
+  }
+
+  const outcome = recordPassByStudentId(s.id, { source: "SCAN", rawTagId: clean });
+  finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex);
 }
 
 function recordPassByTagId(tagId) {
-  const clean = String(tagId).trim();
-  if (!clean) return;
-
-  const s = students.find(x => x.tagId === clean);
-  if (!s) {
-    pushFeedItem(`<b>Unknown tag</b>: ${clean}`);
-    return;
-  }
-  recordPassByStudentId(s.id, { source: "SCAN", rawTagId: clean });
+  const capture = { wallTimeIso: new Date().toISOString(), perfMs: performance.now() };
+  recordRfidKeyboardEvent(String(tagId), capture);
 }
 
 // ===== Session controls =====
@@ -1508,6 +1622,7 @@ function startRun() {
   elFeed.innerHTML = "";
   pushFeedItem(`<b>Started</b> — ${sessionConfig.label} — shared start time`);
   renderGrid();
+  renderAuditIndicator();
 
   session.timerHandle = window.setInterval(() => {
     elElapsed.textContent = fmtTime(nowElapsedMs());
@@ -1649,15 +1764,51 @@ function exportCsv() {
 }
 
 // ===== Scan input handling =====
+let scannerPartialTimer = null;
+let scannerTimedOutSinceLastEnter = false;
+
 function focusScanInput() {
   elScanInput.focus();
   elFocusWarn.classList.add("hidden");
 }
 
+function clearScannerPartialTimer() {
+  if (scannerPartialTimer) window.clearTimeout(scannerPartialTimer);
+  scannerPartialTimer = null;
+}
+
+function armScannerPartialTimer() {
+  clearScannerPartialTimer();
+  if (!elScanInput.value) return;
+  scannerTimedOutSinceLastEnter = false;
+  scannerPartialTimer = window.setTimeout(() => {
+    const partial = elScanInput.value;
+    clearScannerPartialTimer();
+    if (!partial) return;
+    scannerTimedOutSinceLastEnter = true;
+    elScanInput.value = "";
+    pushFeedItem(`<b>Scanner warning</b>: partial RFID input timed out.`);
+    recordRfidKeyboardEvent(partial, { wallTimeIso: new Date().toISOString(), perfMs: performance.now() });
+  }, RFID_PARTIAL_TIMEOUT_MS);
+}
+
+elScanInput.addEventListener("input", () => {
+  if (elScanInput.value) armScannerPartialTimer();
+  else clearScannerPartialTimer();
+});
+
 elScanInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
+    e.preventDefault();
+    clearScannerPartialTimer();
     const val = elScanInput.value;
     elScanInput.value = "";
+    if (!val && scannerTimedOutSinceLastEnter) {
+      scannerTimedOutSinceLastEnter = false;
+      return;
+    }
+    scannerTimedOutSinceLastEnter = false;
+    if (!val) return;
     recordPassByTagId(val);
   }
 });
@@ -3368,6 +3519,7 @@ if (btnPrintClass) {
   initSessionData();
   renderGrid();
   renderCounters();
+  renderAuditIndicator();
   maybeRecoverSavedSession();
   focusScanInput();
 })();
