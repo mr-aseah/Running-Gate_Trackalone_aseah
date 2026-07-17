@@ -897,6 +897,8 @@ const SESSION_STORAGE_SCHEMA_VERSION = 1;
 const SESSION_RECOVERY_MAX_WALL_GAP_MS = 12 * 60 * 60 * 1000; // 12 hours
 const RFID_PARTIAL_TIMEOUT_MS = 1500;
 const RFID_SOURCE = "RFID_KEYBOARD";
+const ACCEPTED_LAP_STATUSES = { ACTIVE: "ACTIVE", LEGACY_UNDONE: "LEGACY_UNDONE" };
+const ACCEPTED_LAP_SOURCE_TYPES = { RFID_KEYBOARD: "RFID_KEYBOARD", MANUAL_TAP: "MANUAL_TAP", LEGACY: "LEGACY" };
 const RFID_STATUSES = {
   ACCEPTED: "ACCEPTED",
   DEBOUNCED: "DEBOUNCED",
@@ -939,7 +941,9 @@ let session = {
   lastActionStack: [],     // for UNDO
   dataById: new Map(),     // id -> { splits: [ms], lastScanAtPerf }
   rawHardwareEvents: [],    // immutable RFID keyboard captures with post-processing outcome fields
+  acceptedLaps: [],         // permanent accepted-lap records; dataById.splits is a compatibility projection
   rawEventCounter: 0,
+  acceptedLapCounter: 0,
   persistenceFailed: false,
 };
 
@@ -952,6 +956,7 @@ function initSessionData() {
     });
   }
   session.lastActionStack = [];
+  rebuildAllSplitProjections();
 }
 
 // ===== Utilities =====
@@ -1017,6 +1022,128 @@ function cloneRawHardwareEvents(events) {
   return Array.isArray(events) ? events.map(e => ({ ...e })) : [];
 }
 
+function cloneAcceptedLaps(laps) {
+  return Array.isArray(laps) ? laps.map(l => ({ ...l })) : [];
+}
+
+function makeAcceptedLapId() {
+  session.acceptedLapCounter += 1;
+  const stamp = new Date().toISOString().replace(/[^0-9A-Za-z]/g, "");
+  return `lap_${stamp}_${session.acceptedLapCounter}`;
+}
+
+function advanceAcceptedLapCounterFrom(laps) {
+  let maxCounter = 0;
+  for (const lap of Array.isArray(laps) ? laps : []) {
+    const m = String(lap.lap_id || "").match(/_(\d+)$/);
+    if (m) maxCounter = Math.max(maxCounter, Number(m[1]));
+  }
+  session.acceptedLapCounter = Math.max(session.acceptedLapCounter || 0, maxCounter, Array.isArray(laps) ? laps.length : 0);
+}
+
+function getActiveAcceptedLapsForStudent(studentId) {
+  return (Array.isArray(session.acceptedLaps) ? session.acceptedLaps : [])
+    .filter(l => l && l.student_id === studentId && l.status === ACCEPTED_LAP_STATUSES.ACTIVE && l.voided !== true)
+    .slice()
+    .sort((a, b) => {
+      const am = Number(a.adjusted_elapsed_ms);
+      const bm = Number(b.adjusted_elapsed_ms);
+      if (am !== bm) return am - bm;
+      const as = Number.isFinite(Number(a.scan_number)) ? Number(a.scan_number) : Number.MAX_SAFE_INTEGER;
+      const bs = Number.isFinite(Number(b.scan_number)) ? Number(b.scan_number) : Number.MAX_SAFE_INTEGER;
+      if (as !== bs) return as - bs;
+      return String(a.lap_id || "").localeCompare(String(b.lap_id || ""));
+    });
+}
+
+function projectAcceptedLapsForStudent(studentId) {
+  const laps = getActiveAcceptedLapsForStudent(studentId);
+  const splits = laps.map(l => Number(l.adjusted_elapsed_ms)).filter(ms => Number.isFinite(ms));
+  const individualSplits = splits.map((ms, i) => i === 0 ? ms : ms - splits[i - 1]);
+  return {
+    studentId,
+    currentLapNumber: splits.length,
+    splits,
+    individualSplits,
+    finished: splits.length >= getTargetPasses(),
+  };
+}
+
+function rebuildSplitProjectionForStudent(studentId) {
+  const d = session.dataById.get(studentId);
+  if (!d) return;
+  d.splits = projectAcceptedLapsForStudent(studentId).splits;
+}
+
+function rebuildAllSplitProjections() {
+  if (!session || !session.dataById) return;
+  for (const studentId of session.dataById.keys()) rebuildSplitProjectionForStudent(studentId);
+}
+
+function getRunnerClassSnapshot(student) {
+  if (student && student.runner_class != null) return String(student.runner_class);
+  if (student && student.class != null) return String(student.class);
+  const classCodeEl = document.getElementById("classCode");
+  return classCodeEl ? String(classCodeEl.value || "") : "";
+}
+
+function getStartOffsetSecondsSnapshot(student) {
+  const raw = student && (student.start_offset_seconds ?? student.startOffsetSeconds ?? student.startOffset ?? student.offsetSeconds);
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getStudentIdentitySnapshot(studentId) {
+  const student = students.find(x => x.id === studentId) || {};
+  return {
+    runner_no: student.runner_no != null ? String(student.runner_no) : (student.runnerNo != null ? String(student.runnerNo) : String(student.id || studentId || "")),
+    tag_id: student.tagId != null ? String(student.tagId) : (student.tag_id != null ? String(student.tag_id) : ""),
+    name: student.name != null ? String(student.name) : "",
+    runner_class: getRunnerClassSnapshot(student),
+    start_offset_seconds: getStartOffsetSecondsSnapshot(student),
+  };
+}
+
+function nextScanNumberForStudent(studentId) {
+  let maxScan = 0;
+  for (const lap of Array.isArray(session.acceptedLaps) ? session.acceptedLaps : []) {
+    if (!lap || lap.student_id !== studentId) continue;
+    const n = Number(lap.scan_number);
+    if (Number.isFinite(n)) maxScan = Math.max(maxScan, n);
+  }
+  return maxScan + 1;
+}
+
+function createAcceptedLapRecord(studentId, opts) {
+  const rawElapsed = Number.isFinite(opts && opts.rawElapsedMs) ? opts.rawElapsedMs : nowElapsedMs();
+  const identity = getStudentIdentitySnapshot(studentId);
+  const lap = {
+    lap_id: (opts && opts.lapId) || makeAcceptedLapId(),
+    session_id: session.sessionId || null,
+    student_id: studentId,
+    runner_no: identity.runner_no,
+    tag_id: identity.tag_id,
+    name: identity.name,
+    runner_class: identity.runner_class,
+    start_offset_seconds: identity.start_offset_seconds,
+    scan_number: nextScanNumberForStudent(studentId),
+    source_event_type: (opts && opts.sourceEventType) || ACCEPTED_LAP_SOURCE_TYPES.LEGACY,
+    source_event_id: (opts && Object.prototype.hasOwnProperty.call(opts, "sourceEventId")) ? opts.sourceEventId : null,
+    event_wall_time_iso: (opts && opts.eventWallTimeIso) || new Date().toISOString(),
+    event_perf_ms: (opts && Number.isFinite(opts.eventPerfMs)) ? opts.eventPerfMs : performance.now(),
+    raw_elapsed_ms: rawElapsed,
+    adjusted_elapsed_ms: rawElapsed,
+    source: (opts && opts.source) || "LEGACY",
+    status: ACCEPTED_LAP_STATUSES.ACTIVE,
+    voided: false,
+    correction_reason: null,
+    undone_at_wall_time_iso: null,
+  };
+  session.acceptedLaps.push(lap);
+  rebuildSplitProjectionForStudent(studentId);
+  return lap;
+}
+
 function setPersistenceWarning(show) {
   session.persistenceFailed = !!show;
   if (elPersistenceWarn) elPersistenceWarn.classList.toggle("hidden", !show);
@@ -1057,6 +1184,108 @@ function restoreDataById(savedData) {
   }
 }
 
+function migrateAcceptedLapsFromLegacySnapshot(snapshot) {
+  const savedData = snapshot && snapshot.dataById && typeof snapshot.dataById === "object" ? snapshot.dataById : {};
+  const rawEvents = cloneRawHardwareEvents(snapshot && snapshot.rawHardwareEvents);
+  const migrated = [];
+  for (const st of students) {
+    const splits = Array.isArray(savedData[st.id] && savedData[st.id].splits) ? savedData[st.id].splits : [];
+    for (let i = 0; i < splits.length; i++) {
+      const elapsed = Number(splits[i]);
+      if (!Number.isFinite(elapsed)) continue;
+      const matches = rawEvents.filter(e => e && e.processing_status === RFID_STATUSES.ACCEPTED && e.student_id === st.id && e.accepted_split_index === i);
+      const uniqueRaw = matches.length === 1 ? matches[0] : null;
+      if (matches.length > 1) console.warn(`Ambiguous accepted-lap migration for student ${st.id} split ${i}; preserving as LEGACY.`);
+      const identity = getStudentIdentitySnapshot(st.id);
+      migrated.push({
+        lap_id: `legacy_lap_${String(snapshot.session && snapshot.session.sessionId || "session").replace(/[^0-9A-Za-z]/g, "")}_${String(st.id).replace(/[^0-9A-Za-z]/g, "")}_${i + 1}`,
+        session_id: snapshot.session && snapshot.session.sessionId ? snapshot.session.sessionId : null,
+        student_id: st.id,
+        runner_no: identity.runner_no,
+        tag_id: identity.tag_id,
+        name: identity.name,
+        runner_class: identity.runner_class,
+        start_offset_seconds: identity.start_offset_seconds,
+        scan_number: i + 1,
+        source_event_type: uniqueRaw ? ACCEPTED_LAP_SOURCE_TYPES.RFID_KEYBOARD : ACCEPTED_LAP_SOURCE_TYPES.LEGACY,
+        source_event_id: uniqueRaw ? uniqueRaw.event_id : null,
+        event_wall_time_iso: uniqueRaw ? uniqueRaw.captured_wall_time_iso : (snapshot.savedAtWallTimeIso || null),
+        event_perf_ms: uniqueRaw && Number.isFinite(uniqueRaw.captured_perf_ms) ? uniqueRaw.captured_perf_ms : null,
+        raw_elapsed_ms: elapsed,
+        adjusted_elapsed_ms: elapsed,
+        source: uniqueRaw ? "SCAN" : "LEGACY",
+        status: ACCEPTED_LAP_STATUSES.ACTIVE,
+        voided: false,
+        correction_reason: null,
+        undone_at_wall_time_iso: null,
+      });
+    }
+  }
+  return migrated;
+}
+
+function normalizeAcceptedLapsForRecovery(laps) {
+  const countersByStudent = new Map();
+  return cloneAcceptedLaps(laps).map(lap => {
+    const studentId = lap.student_id;
+    const identity = getStudentIdentitySnapshot(studentId);
+    const current = countersByStudent.get(studentId) || 0;
+    const existingScan = Number(lap.scan_number);
+    const scanNumber = Number.isFinite(existingScan) && existingScan > 0 ? existingScan : current + 1;
+    countersByStudent.set(studentId, Math.max(current, scanNumber));
+    const status = lap.status || ACCEPTED_LAP_STATUSES.ACTIVE;
+    return {
+      ...lap,
+      runner_no: lap.runner_no != null ? String(lap.runner_no) : identity.runner_no,
+      tag_id: lap.tag_id != null ? String(lap.tag_id) : identity.tag_id,
+      name: lap.name != null ? String(lap.name) : identity.name,
+      runner_class: lap.runner_class != null ? String(lap.runner_class) : identity.runner_class,
+      start_offset_seconds: Number.isFinite(Number(lap.start_offset_seconds)) ? Number(lap.start_offset_seconds) : identity.start_offset_seconds,
+      scan_number: scanNumber,
+      status,
+      voided: lap.voided === true || status === ACCEPTED_LAP_STATUSES.LEGACY_UNDONE,
+      correction_reason: lap.correction_reason != null ? lap.correction_reason : null,
+      undone_at_wall_time_iso: lap.undone_at_wall_time_iso || null,
+    };
+  });
+}
+
+function buildAcceptedScanProjectionRows(studentId) {
+  const scoped = (Array.isArray(session.acceptedLaps) ? session.acceptedLaps : [])
+    .filter(l => !studentId || l.student_id === studentId);
+  const activeByLapId = new Map();
+  const studentsInScope = Array.from(new Set(scoped.map(l => l.student_id)));
+  for (const sid of studentsInScope) {
+    getActiveAcceptedLapsForStudent(sid).forEach((lap, index, active) => {
+      const previous = index > 0 ? Number(active[index - 1].adjusted_elapsed_ms) : 0;
+      activeByLapId.set(lap.lap_id, {
+        lapNumber: index + 1,
+        lapTimeSeconds: (Number(lap.adjusted_elapsed_ms) - previous) / 1000,
+      });
+    });
+  }
+  return scoped.map(lap => {
+    const active = activeByLapId.get(lap.lap_id);
+    return {
+      session_id: lap.session_id,
+      runner_no: lap.runner_no || "",
+      tag_id: lap.tag_id || "",
+      name: lap.name || "",
+      class: lap.runner_class || "",
+      start_offset_seconds: Number.isFinite(Number(lap.start_offset_seconds)) ? Number(lap.start_offset_seconds) : 0,
+      scan_number: Number.isFinite(Number(lap.scan_number)) ? Number(lap.scan_number) : null,
+      lap_number: active ? active.lapNumber : null,
+      raw_scan_time: lap.event_wall_time_iso || null,
+      elapsed_time_seconds: Number.isFinite(Number(lap.adjusted_elapsed_ms)) ? Number(lap.adjusted_elapsed_ms) / 1000 : null,
+      lap_time_seconds: active ? active.lapTimeSeconds : null,
+      status: lap.status || ACCEPTED_LAP_STATUSES.ACTIVE,
+      source: lap.source || "",
+      voided: lap.voided === true,
+      correction_reason: lap.correction_reason || null,
+    };
+  });
+}
+
 function buildSessionSnapshot(status) {
   const elapsedMsAtSave = session.started ? nowElapsedMs() : (Number.isFinite(session.endedElapsedMs) ? session.endedElapsedMs : 0);
   let finalElapsedMs = elapsedMsAtSave;
@@ -1085,6 +1314,7 @@ function buildSessionSnapshot(status) {
     students: students.map(s => ({ ...s })),
     dataById: serializeSessionDataById(),
     rawHardwareEvents: cloneRawHardwareEvents(session.rawHardwareEvents),
+    acceptedLaps: cloneAcceptedLaps(session.acceptedLaps),
     lastActionStack: session.lastActionStack.map(a => ({ ...a })),
     ui: {
       elapsedText: elElapsed ? elElapsed.textContent : "",
@@ -1098,7 +1328,7 @@ function buildSessionSnapshot(status) {
 
 function saveSessionSnapshot(status) {
   try {
-    if (!session.sessionId && !session.started && session.dataById.size === 0 && session.rawHardwareEvents.length === 0) return;
+    if (!session.sessionId && !session.started && session.dataById.size === 0 && session.rawHardwareEvents.length === 0 && session.acceptedLaps.length === 0) return;
     const snapshot = buildSessionSnapshot(status);
     localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
     setPersistenceWarning(false);
@@ -1179,6 +1409,9 @@ function applyRecoveredSessionSnapshot(snapshot) {
   session.rawEventCounter = session.rawHardwareEvents.length;
   session.persistenceFailed = false;
   restoreDataById(snapshot.dataById);
+  session.acceptedLaps = Array.isArray(snapshot.acceptedLaps) ? normalizeAcceptedLapsForRecovery(snapshot.acceptedLaps) : migrateAcceptedLapsFromLegacySnapshot(snapshot);
+  advanceAcceptedLapCounterFrom(session.acceptedLaps);
+  rebuildAllSplitProjections();
 
   if (sessionPreset && snapshot.ui && snapshot.ui.sessionPresetValue) sessionPreset.value = snapshot.ui.sessionPresetValue;
   if (customReps && snapshot.ui && snapshot.ui.customRepsValue) customReps.value = snapshot.ui.customRepsValue;
@@ -1463,7 +1696,7 @@ function pushFeedItem(msg) {
 }
 
 // ===== Core logic =====
-function recordPassByStudentId(studentId, { source, rawTagId } = {}) {
+function recordPassByStudentId(studentId, { source, rawTagId, sourceEventId, eventWallTimeIso, eventPerfMs } = {}) {
   if (!session.started) return { status: RFID_STATUSES.SESSION_NOT_STARTED, reason: "Session is not started.", acceptedSplitIndex: null };
 
   const target = getTargetPasses();
@@ -1496,10 +1729,17 @@ if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
   }
 
   const beforeLen = d.splits.length;
-  d.splits.push(elapsed);
+  const lap = createAcceptedLapRecord(studentId, {
+    sourceEventType: source === "SCAN" ? ACCEPTED_LAP_SOURCE_TYPES.RFID_KEYBOARD : ACCEPTED_LAP_SOURCE_TYPES.MANUAL_TAP,
+    sourceEventId: sourceEventId || null,
+    eventWallTimeIso: eventWallTimeIso || new Date().toISOString(),
+    eventPerfMs: Number.isFinite(eventPerfMs) ? eventPerfMs : perfNow,
+    rawElapsedMs: elapsed,
+    source: source === "SCAN" ? "SCAN" : "TAP",
+  });
   d.lastScanAtPerf = perfNow;
 
-  session.lastActionStack.push({ studentId, removedSplit: elapsed, index: beforeLen, source, rawTagId });
+  session.lastActionStack.push({ studentId, lapId: lap.lap_id, removedSplit: elapsed, index: beforeLen, source, rawTagId });
   btnUndo.disabled = session.lastActionStack.length === 0;
 
   const st = d.splits.length; // 1..target
@@ -1567,7 +1807,7 @@ function recordRfidKeyboardEvent(originalValue, capture) {
     return;
   }
 
-  const outcome = recordPassByStudentId(s.id, { source: "SCAN", rawTagId: clean });
+  const outcome = recordPassByStudentId(s.id, { source: "SCAN", rawTagId: clean, sourceEventId: event.event_id, eventWallTimeIso: event.captured_wall_time_iso, eventPerfMs: event.captured_perf_ms });
   finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex);
 }
 
@@ -1613,6 +1853,8 @@ function startRun() {
   session.startWallTimeIso = new Date().toISOString();
   session.endedWallTimeIso = null;
   session.endedElapsedMs = null;
+  session.acceptedLaps = [];
+  session.acceptedLapCounter = 0;
 
   btnStart.disabled = true;
   btnStop.disabled = false;
@@ -1658,9 +1900,13 @@ function undoLast() {
   const s = students.find(x => x.id === action.studentId);
   if (!d || !s) return;
 
-  const idx = action.index;
-  if (d.splits[idx] === action.removedSplit) d.splits.splice(idx, 1);
-  else d.splits.pop();
+  const lap = (session.acceptedLaps || []).find(l => l.lap_id === action.lapId);
+  if (lap && lap.status === ACCEPTED_LAP_STATUSES.ACTIVE) {
+    lap.status = ACCEPTED_LAP_STATUSES.LEGACY_UNDONE;
+    lap.voided = true;
+    lap.undone_at_wall_time_iso = new Date().toISOString();
+  }
+  rebuildSplitProjectionForStudent(action.studentId);
 
   pushFeedItem(`<b>Undo</b> — ${s.name} removed ${fmtTime(action.removedSplit)}`);
   btnUndo.disabled = session.lastActionStack.length === 0;
