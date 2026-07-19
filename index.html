@@ -544,12 +544,15 @@ button.big {
 
   <!-- Session preset controls -->
   <div class="session-controls"> 
+    <label for="sessionName"><b>Name:</b></label>
+    <input id="sessionName" type="text" value="PE Run" style="width:140px;">
     <label for="sessionPreset"><b>Session:</b></label>
     <select id="sessionPreset">
-      <option value="3x800" selected>3 × 800m (2.4km)</option>
-      <option value="6x200">6 × 200m (1.2km)</option>
-      <option value="8x200">8 × 200m (1.6km)</option>
-      <option value="4x600">4 × 600m (2.4km)</option>
+      <option value="6x400" selected>6 × 400m (2400m)</option>
+      <option value="5x480">5 × 480m (2400m)</option>
+      <option value="5x400">5 × 400m (2000m)</option>
+      <option value="4x400">4 × 400m (1600m)</option>
+      <option value="3x400">3 × 400m (1200m)</option>
       <option value="custom">Custom…</option>
     </select>
 
@@ -557,10 +560,13 @@ button.big {
       <label for="customReps">Reps:</label>
       <input id="customReps" type="number" min="1" max="30" value="3" style="width:70px;">
       <label for="customDist">Distance (m):</label>
-      <input id="customDist" type="number" min="50" max="5000" value="600" style="width:90px;">
+      <input id="customDist" type="number" min="50" max="5000" value="400" style="width:90px;">
     </span>
 
+    <label for="debounceSeconds">Debounce (s):</label>
+    <input id="debounceSeconds" type="number" min="0" step="0.1" value="2" style="width:70px;">
     <span id="sessionSummary" style="font-size:0.95em; opacity:0.9;"></span>
+    <span id="debounceWarning" class="warn"></span>
   </div>
 </div>
 
@@ -675,6 +681,7 @@ button.big {
         </div>
         <div class="hintRow small auditIndicator">
           RFID audit: total <span id="auditTotal">0</span> • accepted <span id="auditAccepted">0</span> • debounced <span id="auditDebounced">0</span> • too soon <span id="auditTooSoon">0</span> • unknown <span id="auditUnknown">0</span> • malformed <span id="auditMalformed">0</span>
+          <span> • review <span id="auditReview">0</span></span>
           <span id="persistenceWarn" class="persistWarn hidden">Event persistence failed — in-memory audit only.</span>
         </div>
       </div>
@@ -695,7 +702,11 @@ button.big {
   <div><span class="k">Reps:</span> <span id="sessionReps">3</span></div>
   <div><span class="k">Rep distance:</span> <span id="sessionDist">800</span>m</div>
   <div><span class="k">Total:</span> <span id="sessionTotal">2400</span>m</div>
-  <div><span class="k">Anti-double:</span> 1200ms</div>
+  <div><span class="k">Session name:</span> <span id="sessionNameDisplay">PE Run</span></div>
+  <div><span class="k">Session ID:</span> <span id="sessionIdDisplay">—</span></div>
+  <div><span class="k">Started:</span> <span id="sessionStartDisplay">Not started</span></div>
+  <div><span class="k">Debounce:</span> <span id="debounceDisplay">2</span>s</div>
+  <div><span class="k">Notes:</span> <textarea id="sessionNotes" rows="2" style="width:95%;"></textarea></div>
   <div><span class="k">Roster loaded:</span> <span id="rosterCount">0</span></div>
 </div>
       </div>
@@ -882,7 +893,7 @@ button.big {
 // ===== Config =====
 // Debounce: ignore repeated scans on the same student within this window.
 // (Useful for hands-free/continuous scanners that may re-read the same card.)
-const ANTI_DOUBLE_MS = 2000; // was 1200
+const DEFAULT_DEBOUNCE_SECONDS = 2;
 
 // Minimum time between *laps* for the same student.
 // This is a sanity filter to block accidental re-reads when a card lingers in the scan zone.
@@ -918,10 +929,11 @@ const RFID_STATUSES = {
   ALREADY_FINISHED: "ALREADY_FINISHED",
   SESSION_NOT_STARTED: "SESSION_NOT_STARTED",
   INACTIVE_RUNNER: "INACTIVE_RUNNER",
+  BEFORE_WAVE_START: "BEFORE_WAVE_START",
 };
 
 // ===== Session preset support =====
-const DEFAULT_SESSION = { label: "3 × 800m", reps: 3, repDistanceM: 800 };
+const DEFAULT_SESSION = { label: "6 × 400m", reps: 6, repDistanceM: 400, totalDistanceM: 2400, debounceSeconds: DEFAULT_DEBOUNCE_SECONDS, debounceMs: 2000, sessionName: "PE Run", notes: "" };
 let sessionConfig = { ...DEFAULT_SESSION };
 
 function clampInt(n, min, max, fallback) {
@@ -931,9 +943,11 @@ function clampInt(n, min, max, fallback) {
 }
 
 function getPresetConfig(value) {
-  if (value === "3x800") return { label: "3 × 800m", reps: 3, repDistanceM: 800 };
-  if (value === "8x200") return { label: "8 × 200m", reps: 8, repDistanceM: 200 };
-  if (value === "4x600") return { label: "4 × 600m", reps: 4, repDistanceM: 600 };
+  if (value === "6x400") return { label: "6 × 400m", reps: 6, repDistanceM: 400, totalDistanceM: 2400 };
+  if (value === "5x480") return { label: "5 × 480m", reps: 5, repDistanceM: 480, totalDistanceM: 2400 };
+  if (value === "5x400") return { label: "5 × 400m", reps: 5, repDistanceM: 400, totalDistanceM: 2000 };
+  if (value === "4x400") return { label: "4 × 400m", reps: 4, repDistanceM: 400, totalDistanceM: 1600 };
+  if (value === "3x400") return { label: "3 × 400m", reps: 3, repDistanceM: 400, totalDistanceM: 1200 };
   return { ...DEFAULT_SESSION };
 }
 
@@ -957,6 +971,9 @@ let session = {
   rawEventCounter: 0,
   acceptedLapCounter: 0,
   persistenceFailed: false,
+  lockedRosterSnapshot: [],
+  lockedDebounceMs: 2000,
+  lockedDebounceSeconds: 2,
 };
 
 function rebuildTagLookup() {
@@ -1138,8 +1155,13 @@ function getStartOffsetSecondsSnapshot(student) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function getLockedRunnerSnapshot(studentId) {
+  const locked = Array.isArray(session.lockedRosterSnapshot) ? session.lockedRosterSnapshot.find(x => String(x.id) === String(studentId)) : null;
+  return locked || students.find(x => String(x.id) === String(studentId)) || null;
+}
+
 function getStudentIdentitySnapshot(studentId) {
-  const student = students.find(x => x.id === studentId) || {};
+  const student = getLockedRunnerSnapshot(studentId) || {};
   return {
     runner_no: student.runner_no != null ? String(student.runner_no) : (student.runnerNo != null ? String(student.runnerNo) : String(student.id || studentId || "")),
     tag_id: student.tagId != null ? String(student.tagId) : (student.tag_id != null ? String(student.tag_id) : ""),
@@ -1177,7 +1199,7 @@ function createAcceptedLapRecord(studentId, opts) {
     event_wall_time_iso: (opts && opts.eventWallTimeIso) || new Date().toISOString(),
     event_perf_ms: (opts && Number.isFinite(opts.eventPerfMs)) ? opts.eventPerfMs : performance.now(),
     raw_elapsed_ms: rawElapsed,
-    adjusted_elapsed_ms: rawElapsed,
+    adjusted_elapsed_ms: Number.isFinite(opts && opts.adjustedElapsedMs) ? opts.adjustedElapsedMs : rawElapsed,
     source: (opts && opts.source) || "LEGACY",
     status: ACCEPTED_LAP_STATUSES.ACTIVE,
     voided: false,
@@ -1203,6 +1225,7 @@ function renderAuditIndicator() {
   if (elAuditTooSoon) elAuditTooSoon.textContent = String(count(RFID_STATUSES.TOO_SOON));
   if (elAuditUnknown) elAuditUnknown.textContent = String(count(RFID_STATUSES.UNKNOWN_TAG));
   if (elAuditMalformed) elAuditMalformed.textContent = String(count(RFID_STATUSES.MALFORMED));
+  if (elAuditReview) elAuditReview.textContent = String(count(RFID_STATUSES.BEFORE_WAVE_START));
   if (elPersistenceWarn) elPersistenceWarn.classList.toggle("hidden", !session.persistenceFailed);
 }
 
@@ -1356,6 +1379,7 @@ function buildSessionSnapshot(status) {
       elapsedMsAtSave: session.started ? elapsedMsAtSave : finalElapsedMs,
     },
     sessionConfig: { ...sessionConfig },
+    lockedRosterSnapshot: Array.isArray(session.lockedRosterSnapshot) ? session.lockedRosterSnapshot.map(s => ({ ...s })) : [],
     students: students.map(s => ({ ...s })),
     dataById: serializeSessionDataById(),
     rawHardwareEvents: cloneRawHardwareEvents(session.rawHardwareEvents),
@@ -1367,6 +1391,9 @@ function buildSessionSnapshot(status) {
       customRepsValue: customReps ? customReps.value : "",
       customDistValue: customDist ? customDist.value : "",
       classCodeValue: document.getElementById("classCode") ? document.getElementById("classCode").value : "",
+      sessionNameValue: sessionNameInput ? sessionNameInput.value : "",
+      sessionNotesValue: sessionNotesInput ? sessionNotesInput.value : "",
+      debounceSecondsValue: debounceSecondsInput ? debounceSecondsInput.value : "",
     },
   };
 }
@@ -1442,7 +1469,10 @@ function applyRecoveredSessionSnapshot(snapshot) {
   const restoredElapsedMs = calculateRecoveredElapsedMs(snapshot, elapsedMsAtSave);
 
   setStudents(snapshot.students.map(s => ({ ...s })));
-  sessionConfig = { ...snapshot.sessionConfig };
+  sessionConfig = { ...DEFAULT_SESSION, ...snapshot.sessionConfig };
+  sessionConfig.totalDistanceM = Number(sessionConfig.reps || 0) * Number(sessionConfig.repDistanceM || 0);
+  sessionConfig.debounceSeconds = Number.isFinite(Number(sessionConfig.debounceSeconds)) ? Number(sessionConfig.debounceSeconds) : DEFAULT_DEBOUNCE_SECONDS;
+  sessionConfig.debounceMs = Number.isFinite(Number(sessionConfig.debounceMs)) ? Number(sessionConfig.debounceMs) : Math.round(sessionConfig.debounceSeconds * 1000);
   session.sessionId = snapshot.session.sessionId || makeSessionId();
   session.started = snapshot.status === "ACTIVE" && !!snapshot.session.started;
   session.startWallTimeIso = snapshot.session.startWallTimeIso || null;
@@ -1450,6 +1480,9 @@ function applyRecoveredSessionSnapshot(snapshot) {
   session.endedElapsedMs = Number.isFinite(Number(snapshot.session.endedElapsedMs)) ? Number(snapshot.session.endedElapsedMs) : (session.started ? null : elapsedMsAtSave);
   session.startPerf = session.started ? (performance.now() - restoredElapsedMs) : null;
   session.lastActionStack = Array.isArray(snapshot.lastActionStack) ? snapshot.lastActionStack.map(a => ({ ...a })) : [];
+  session.lockedRosterSnapshot = Array.isArray(snapshot.lockedRosterSnapshot) ? snapshot.lockedRosterSnapshot.map((x,i)=>normalizeStudentRecord(x,i+1)) : students.map(s => ({ ...s, start_offset_seconds: Number.isFinite(Number(s.start_offset_seconds)) ? Number(s.start_offset_seconds) : 0 }));
+  session.lockedDebounceSeconds = sessionConfig.debounceSeconds;
+  session.lockedDebounceMs = sessionConfig.debounceMs;
   session.rawHardwareEvents = cloneRawHardwareEvents(snapshot.rawHardwareEvents);
   session.rawEventCounter = session.rawHardwareEvents.length;
   session.persistenceFailed = false;
@@ -1463,6 +1496,9 @@ function applyRecoveredSessionSnapshot(snapshot) {
   if (customDist && snapshot.ui && snapshot.ui.customDistValue) customDist.value = snapshot.ui.customDistValue;
   const classCode = document.getElementById("classCode");
   if (classCode && snapshot.ui && snapshot.ui.classCodeValue) classCode.value = snapshot.ui.classCodeValue;
+  if (sessionNameInput) sessionNameInput.value = (snapshot.ui && snapshot.ui.sessionNameValue) || sessionConfig.sessionName || "PE Run";
+  if (sessionNotesInput) sessionNotesInput.value = (snapshot.ui && snapshot.ui.sessionNotesValue) || sessionConfig.notes || "";
+  if (debounceSecondsInput) debounceSecondsInput.value = String((snapshot.ui && snapshot.ui.debounceSecondsValue) || sessionConfig.debounceSeconds || DEFAULT_DEBOUNCE_SECONDS);
 
   paintSessionPanel(sessionConfig.label, sessionConfig.reps, sessionConfig.repDistanceM);
   updateSessionConfigPreview();
@@ -1584,6 +1620,15 @@ const rosterEditorText = document.getElementById("rosterEditorText");
 const rosterEditorStatus = document.getElementById("rosterEditorStatus");
 
 // New (optional) UI elements for presets/custom
+const sessionNameInput = document.getElementById("sessionName");
+const sessionNotesInput = document.getElementById("sessionNotes");
+const debounceSecondsInput = document.getElementById("debounceSeconds");
+const debounceWarningEl = document.getElementById("debounceWarning");
+const debounceDisplayEl = document.getElementById("debounceDisplay");
+const sessionNameDisplayEl = document.getElementById("sessionNameDisplay");
+const sessionIdDisplayEl = document.getElementById("sessionIdDisplay");
+const sessionStartDisplayEl = document.getElementById("sessionStartDisplay");
+const elAuditReview = document.getElementById("auditReview");
 const sessionPreset = document.getElementById("sessionPreset");
 const customFields = document.getElementById("customFields");
 const customReps = document.getElementById("customReps");
@@ -1594,11 +1639,49 @@ const sessionRepsEl  = document.getElementById("sessionReps");
 const sessionDistEl  = document.getElementById("sessionDist");
 const sessionTotalEl = document.getElementById("sessionTotal");
 
+function validatedDebounceSeconds() {
+  const text = debounceSecondsInput ? String(debounceSecondsInput.value || "").trim() : "";
+  const raw = text === "" ? DEFAULT_DEBOUNCE_SECONDS : Number(text);
+  const seconds = Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_DEBOUNCE_SECONDS;
+  if (debounceSecondsInput) debounceSecondsInput.value = String(seconds);
+  if (debounceWarningEl) {
+    debounceWarningEl.textContent = seconds < 0.5 ? "Very low debounce may accept duplicate reads." : (seconds > 10 ? "High debounce may reject legitimate same-runner laps." : "");
+  }
+  if (debounceDisplayEl) debounceDisplayEl.textContent = String(seconds);
+  return seconds;
+}
+
+function buildSessionConfigFromControls() {
+  let cfg;
+  if (sessionPreset && sessionPreset.value === "custom") {
+    const reps = clampInt(customReps && customReps.value, 1, 30, 6);
+    const dist = clampInt(customDist && customDist.value, 50, 5000, 400);
+    cfg = { label: `${reps} × ${dist}m`, reps, repDistanceM: dist, totalDistanceM: reps * dist };
+  } else if (sessionPreset) {
+    cfg = getPresetConfig(sessionPreset.value);
+  } else {
+    cfg = { ...DEFAULT_SESSION };
+  }
+  const debounceSeconds = session.started ? session.lockedDebounceSeconds : validatedDebounceSeconds();
+  return {
+    ...cfg,
+    totalDistanceM: Number(cfg.reps) * Number(cfg.repDistanceM),
+    debounceSeconds,
+    debounceMs: Math.round(debounceSeconds * 1000),
+    sessionName: sessionNameInput ? String(sessionNameInput.value || "").trim() || "PE Run" : (sessionConfig.sessionName || "PE Run"),
+    notes: sessionNotesInput ? String(sessionNotesInput.value || "") : (sessionConfig.notes || ""),
+  };
+}
+
 function paintSessionPanel(label, reps, dist) {
   if (sessionLabelEl) sessionLabelEl.textContent = label;
   if (sessionRepsEl)  sessionRepsEl.textContent = reps;
   if (sessionDistEl)  sessionDistEl.textContent = dist;
-  if (sessionTotalEl) sessionTotalEl.textContent = reps * dist;
+  if (sessionTotalEl) sessionTotalEl.textContent = Number(reps) * Number(dist);
+  if (debounceDisplayEl) debounceDisplayEl.textContent = String(session.started ? session.lockedDebounceSeconds : validatedDebounceSeconds());
+  if (sessionNameDisplayEl) sessionNameDisplayEl.textContent = sessionConfig.sessionName || (sessionNameInput ? sessionNameInput.value : "PE Run");
+  if (sessionIdDisplayEl) sessionIdDisplayEl.textContent = session.sessionId || "—";
+  if (sessionStartDisplayEl) sessionStartDisplayEl.textContent = session.startWallTimeIso || "Not started";
 }
 
 function getTargetPasses() {
@@ -1609,26 +1692,22 @@ function updateSessionConfigPreview() {
   // If the HTML controls aren't present, do nothing (keeps app backwards-compatible)
   if (!sessionPreset || !sessionSummary) return;
 
+  const cfg = buildSessionConfigFromControls();
   if (sessionPreset.value === "custom") {
     if (customFields) customFields.style.display = "inline-flex";
-    const reps = clampInt(customReps && customReps.value, 1, 30, 3);
-    const dist = clampInt(customDist && customDist.value, 50, 5000, 600);
-    sessionSummary.textContent = `Selected: ${reps} × ${dist}m (Total ${reps * dist}m)`;
-    paintSessionPanel(`${reps} × ${dist}m`, reps, dist);
-
   } else {
     if (customFields) customFields.style.display = "none";
-    const cfg = getPresetConfig(sessionPreset.value);
-    sessionSummary.textContent = `Selected: ${cfg.label} (Total ${cfg.reps * cfg.repDistanceM}m)`;
-    paintSessionPanel(cfg.label, cfg.reps, cfg.repDistanceM);
-
   }
+  sessionSummary.textContent = `Selected: ${cfg.label} (Total ${cfg.totalDistanceM}m) • debounce ${cfg.debounceSeconds}s`;
+  sessionConfig = { ...sessionConfig, ...cfg };
+  paintSessionPanel(cfg.label, cfg.reps, cfg.repDistanceM);
 }
 
 function lockSessionControls(lock) {
   if (sessionPreset) sessionPreset.disabled = lock;
   if (customReps) customReps.disabled = lock;
   if (customDist) customDist.disabled = lock;
+  if (debounceSecondsInput) debounceSecondsInput.disabled = lock;
 }
 
 // ===== Rendering =====
@@ -1766,13 +1845,22 @@ function recordPassByStudentId(studentId, { source, rawTagId, sourceEventId, eve
   }
 
 const perfNow = performance.now();
-if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
+const rawElapsed = Number.isFinite(eventPerfMs) ? Math.max(0, eventPerfMs - session.startPerf) : nowElapsedMs();
+const offsetSeconds = Number.isFinite(Number(getLockedRunnerSnapshot(studentId) && getLockedRunnerSnapshot(studentId).start_offset_seconds)) ? Number(getLockedRunnerSnapshot(studentId).start_offset_seconds) : 0;
+const adjustedElapsed = rawElapsed - (offsetSeconds * 1000);
+if (adjustedElapsed < 0) {
+  const msg = `Runner offset start is ${offsetSeconds}s; scan was ${fmtTime(Math.abs(adjustedElapsed))} early.`;
+  pushFeedItem(`<b>Before wave start</b>: ${s.name || s.runner_no} — ${msg}`);
+  return { status: RFID_STATUSES.BEFORE_WAVE_START, reason: msg, acceptedSplitIndex: null };
+}
+const debounceMs = Number.isFinite(session.lockedDebounceMs) ? session.lockedDebounceMs : 2000;
+if ((perfNow - d.lastScanAtPerf) < debounceMs) {
   const srcLabel = (source == null || source === "") ? "input" : source;
   pushFeedItem(`<b>Ignored</b>: ${s.name} (double ${srcLabel})`);
-  return { status: RFID_STATUSES.DEBOUNCED, reason: `Same runner scanned within ${ANTI_DOUBLE_MS} ms.`, acceptedSplitIndex: null };
+  return { status: RFID_STATUSES.DEBOUNCED, reason: `Same runner scanned within ${debounceMs} ms.`, acceptedSplitIndex: null };
 }
 
-  const elapsed = nowElapsedMs();
+  const elapsed = adjustedElapsed;
 
   const prev = d.splits[d.splits.length - 1];
   const minLapMs = getMinLapMs();
@@ -1789,12 +1877,13 @@ if ((perfNow - d.lastScanAtPerf) < ANTI_DOUBLE_MS) {
     sourceEventId: sourceEventId || null,
     eventWallTimeIso: eventWallTimeIso || new Date().toISOString(),
     eventPerfMs: Number.isFinite(eventPerfMs) ? eventPerfMs : perfNow,
-    rawElapsedMs: elapsed,
+    rawElapsedMs: rawElapsed,
+    adjustedElapsedMs: adjustedElapsed,
     source: source === "SCAN" ? "SCAN" : "TAP",
   });
   d.lastScanAtPerf = perfNow;
 
-  session.lastActionStack.push({ studentId, lapId: lap.lap_id, removedSplit: elapsed, index: beforeLen, source, rawTagId });
+  session.lastActionStack.push({ studentId, lapId: lap.lap_id, removedSplit: adjustedElapsed, index: beforeLen, source, rawTagId });
   btnUndo.disabled = session.lastActionStack.length === 0;
 
   const st = d.splits.length; // 1..target
@@ -1890,15 +1979,10 @@ function startRun() {
   }
 
   // Lock in sessionConfig at the moment Start is pressed
-  if (sessionPreset && sessionPreset.value === "custom") {
-    const reps = clampInt(customReps && customReps.value, 1, 30, 3);
-    const dist = clampInt(customDist && customDist.value, 50, 5000, 600);
-    sessionConfig = { label: `${reps} × ${dist}m`, reps, repDistanceM: dist };
-  } else if (sessionPreset) {
-    sessionConfig = getPresetConfig(sessionPreset.value);
-  } else {
-    sessionConfig = { ...DEFAULT_SESSION };
-  }
+  sessionConfig = buildSessionConfigFromControls();
+  session.lockedDebounceSeconds = sessionConfig.debounceSeconds;
+  session.lockedDebounceMs = sessionConfig.debounceMs;
+  session.lockedRosterSnapshot = getActiveStudents().map(s => ({ ...s }));
   paintSessionPanel(sessionConfig.label, sessionConfig.reps, sessionConfig.repDistanceM);
   lockSessionControls(true);
   updateSessionConfigPreview();
@@ -1919,7 +2003,8 @@ function startRun() {
   btnUndo.disabled = true;
 
   elFeed.innerHTML = "";
-  pushFeedItem(`<b>Started</b> — ${sessionConfig.label} — shared start time`);
+  paintSessionPanel(sessionConfig.label, sessionConfig.reps, sessionConfig.repDistanceM);
+  pushFeedItem(`<b>Started</b> — ${sessionConfig.sessionName || "PE Run"} — ${sessionConfig.label} — ${session.startWallTimeIso}`);
   renderGrid();
   renderAuditIndicator();
 
@@ -2374,7 +2459,10 @@ function editRoster(updatedRows) {
   const validated = validateRosterRows(updatedRows.map((r, i) => ({ ...r, __rowNo: i + 1 })), { v2: true });
   if (!validated.ok) return validated;
   if (session.started) {
-    const ok = window.confirm("Apply roster edits during an active session? Future scans use updated tags. Prior raw events and accepted-lap snapshots remain unchanged.");
+    const byId = new Map(students.map(st => [String(st.id), st]));
+    const offsetChanged = validated.students.some(st => byId.has(String(st.id)) && Number(byId.get(String(st.id)).start_offset_seconds || 0) !== Number(st.start_offset_seconds || 0));
+    if (offsetChanged) return { ok: false, students, report: ["Start offsets are locked for an active session. End/restart the session or use a later audited correction feature."] };
+    const ok = window.confirm("Apply non-offset roster edits during an active session? Future scans use updated tags. Prior raw events and accepted-lap snapshots remain unchanged.");
     if (!ok) return { ok: false, students, report: ["Roster edit cancelled."] };
   }
   setStudents(validated.students);
@@ -3940,6 +4028,9 @@ if (btnPrintClass) {
     sessionPreset.addEventListener("change", updateSessionConfigPreview);
     if (customReps) customReps.addEventListener("input", updateSessionConfigPreview);
     if (customDist) customDist.addEventListener("input", updateSessionConfigPreview);
+    if (debounceSecondsInput) debounceSecondsInput.addEventListener("input", updateSessionConfigPreview);
+    if (sessionNameInput) sessionNameInput.addEventListener("input", updateSessionConfigPreview);
+    if (sessionNotesInput) sessionNotesInput.addEventListener("input", () => { sessionConfig.notes = sessionNotesInput.value; saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED"); });
     updateSessionConfigPreview();
   }
 
