@@ -918,8 +918,10 @@ const SESSION_STORAGE_SCHEMA_VERSION = 1;
 const SESSION_RECOVERY_MAX_WALL_GAP_MS = 12 * 60 * 60 * 1000; // 12 hours
 const RFID_PARTIAL_TIMEOUT_MS = 1500;
 const RFID_SOURCE = "RFID_KEYBOARD";
-const ACCEPTED_LAP_STATUSES = { ACTIVE: "ACTIVE", LEGACY_UNDONE: "LEGACY_UNDONE" };
-const ACCEPTED_LAP_SOURCE_TYPES = { RFID_KEYBOARD: "RFID_KEYBOARD", MANUAL_TAP: "MANUAL_TAP", LEGACY: "LEGACY" };
+const ACCEPTED_LAP_STATUSES = { ACTIVE: "ACTIVE", LEGACY_UNDONE: "LEGACY_UNDONE", VOIDED: "VOIDED" };
+const ACCEPTED_LAP_SOURCE_TYPES = { RFID_KEYBOARD: "RFID_KEYBOARD", MANUAL_TAP: "MANUAL_TAP", MANUAL_CORRECTION: "MANUAL_CORRECTION", LEGACY: "LEGACY" };
+const CORRECTION_ACTIONS = { MANUAL_ADD_CURRENT: "MANUAL_ADD_CURRENT", MANUAL_ADD_CORRECTED: "MANUAL_ADD_CORRECTED", VOID_LAP: "VOID_LAP", QUICK_UNDO: "QUICK_UNDO" };
+const CORRECTION_STATUSES = { APPLIED: "APPLIED", REJECTED: "REJECTED" };
 const RFID_STATUSES = {
   ACCEPTED: "ACCEPTED",
   DEBOUNCED: "DEBOUNCED",
@@ -968,6 +970,9 @@ let session = {
   dataById: new Map(),     // id -> { splits: [ms], lastScanAtPerf }
   rawHardwareEvents: [],    // immutable RFID keyboard captures with post-processing outcome fields
   acceptedLaps: [],         // permanent accepted-lap records; dataById.splits is a compatibility projection
+  correctionEvents: [],     // immutable manual correction/void audit events
+  correctionEventCounter: 0,
+  correctionOperationIds: new Set(),
   rawEventCounter: 0,
   acceptedLapCounter: 0,
   persistenceFailed: false,
@@ -1088,6 +1093,25 @@ function cloneAcceptedLaps(laps) {
   return Array.isArray(laps) ? laps.map(l => ({ ...l })) : [];
 }
 
+function cloneCorrectionEvents(events) {
+  return Array.isArray(events) ? events.map(e => ({ ...e })) : [];
+}
+
+function makeCorrectionEventId() {
+  session.correctionEventCounter += 1;
+  const stamp = new Date().toISOString().replace(/[^0-9A-Za-z]/g, "");
+  return `corr_${stamp}_${session.correctionEventCounter}`;
+}
+
+function advanceCorrectionEventCounterFrom(events) {
+  let maxCounter = 0;
+  for (const ev of Array.isArray(events) ? events : []) {
+    const m = String(ev.correction_event_id || "").match(/_(\d+)$/);
+    if (m) maxCounter = Math.max(maxCounter, Number(m[1]));
+  }
+  session.correctionEventCounter = Math.max(session.correctionEventCounter || 0, maxCounter, Array.isArray(events) ? events.length : 0);
+}
+
 function makeAcceptedLapId() {
   session.acceptedLapCounter += 1;
   const stamp = new Date().toISOString().replace(/[^0-9A-Za-z]/g, "");
@@ -1205,10 +1229,127 @@ function createAcceptedLapRecord(studentId, opts) {
     voided: false,
     correction_reason: null,
     undone_at_wall_time_iso: null,
+    voided_at_wall_time_iso: null,
+    correction_event_id: (opts && opts.correctionEventId) || null,
   };
   session.acceptedLaps.push(lap);
   rebuildSplitProjectionForStudent(studentId);
   return lap;
+}
+
+
+function formatCorrectedElapsedInput(ms) {
+  if (!Number.isFinite(Number(ms)) || Number(ms) < 0) return "";
+  const totalMs = Math.round(Number(ms));
+  const minutes = Math.floor(totalMs / 60000);
+  const seconds = Math.floor((totalMs % 60000) / 1000);
+  const milli = totalMs % 1000;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(milli).padStart(3, "0")}`;
+}
+
+function parseCorrectedElapsedInput(value) {
+  const text = String(value == null ? "" : value).trim();
+  if (!text) return { ok: false, error: "Time is required." };
+  let ms = null;
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    ms = Number(text) * 1000;
+  } else {
+    const m = text.match(/^(\d+):([0-5]?\d)(?:\.(\d{1,3}))?$/);
+    if (!m) return { ok: false, error: "Use seconds or MM:SS(.sss)." };
+    const frac = (m[3] || "").padEnd(3, "0");
+    ms = (Number(m[1]) * 60 + Number(m[2])) * 1000 + Number(frac || 0);
+  }
+  if (!Number.isFinite(ms) || ms < 0) return { ok: false, error: "Time must be a non-negative finite value." };
+  return { ok: true, valueMs: Math.round(ms) };
+}
+
+function rememberCorrectionOperation(operationId) {
+  if (!operationId) return false;
+  if (!(session.correctionOperationIds instanceof Set)) session.correctionOperationIds = new Set(Array.from(session.correctionOperationIds || []));
+  if (session.correctionOperationIds.has(operationId)) return true;
+  session.correctionOperationIds.add(operationId);
+  return false;
+}
+
+function buildCorrectionEvent(action, studentId, opts) {
+  const identity = getStudentIdentitySnapshot(studentId);
+  return Object.freeze({
+    correction_event_id: makeCorrectionEventId(),
+    session_id: session.sessionId || null,
+    runner_no: identity.runner_no,
+    student_id: studentId,
+    action,
+    created_wall_time_iso: new Date().toISOString(),
+    created_perf_ms: performance.now(),
+    requested_raw_elapsed_ms: opts && Number.isFinite(opts.requestedRawElapsedMs) ? opts.requestedRawElapsedMs : null,
+    applied_adjusted_elapsed_ms: opts && Number.isFinite(opts.appliedAdjustedElapsedMs) ? opts.appliedAdjustedElapsedMs : null,
+    target_lap_id: (opts && opts.targetLapId) || null,
+    related_raw_event_id: (opts && opts.relatedRawEventId) || null,
+    created_lap_id: (opts && opts.createdLapId) || null,
+    reason: (opts && opts.reason) || null,
+    source: (opts && opts.source) || "MANUAL",
+    status: (opts && opts.status) || CORRECTION_STATUSES.APPLIED,
+  });
+}
+
+function activeLapCountForStudent(studentId) { return getActiveAcceptedLapsForStudent(studentId).length; }
+
+function getCorrectionElapsedLimitMs() {
+  if (session.started) return nowElapsedMs();
+  if (Number.isFinite(Number(session.endedElapsedMs))) return Number(session.endedElapsedMs);
+  return null;
+}
+
+function getCorrectionSnapshotStatus() {
+  return session.started ? "ACTIVE" : "COMPLETED";
+}
+
+function addManualLap(studentId, rawElapsedMs, action, opts = {}) {
+  const isCurrentAction = action === CORRECTION_ACTIONS.MANUAL_ADD_CURRENT;
+  if (isCurrentAction && !session.started) return { ok: false, status: "SESSION_NOT_ACTIVE", reason: "Current-time manual add is available only during an active session. Use corrected-time insertion for completed session review." };
+  if (!session.started && !session.sessionId) return { ok: false, status: RFID_STATUSES.SESSION_NOT_STARTED, reason: "Session is not started." };
+  if (rememberCorrectionOperation(opts.operationId)) return { ok: true, duplicate: true, status: "DUPLICATE_IGNORED", reason: "Duplicate correction operation ignored." };
+  const s = students.find(x => x.id === studentId);
+  const d = session.dataById.get(studentId);
+  if (!s || !d || s.active === false) return { ok: false, status: RFID_STATUSES.UNKNOWN_TAG, reason: "Runner not available." };
+  if (action === CORRECTION_ACTIONS.MANUAL_ADD_CORRECTED && !String(opts.reason || "").trim()) return { ok: false, status: "REASON_REQUIRED", reason: "Correction reason is required." };
+  if (!Number.isFinite(Number(rawElapsedMs)) || Number(rawElapsedMs) < 0) return { ok: false, status: "INVALID_TIME", reason: "Raw elapsed time must be non-negative and finite." };
+  const limitMs = getCorrectionElapsedLimitMs();
+  if (Number.isFinite(Number(limitMs)) && Number(rawElapsedMs) > Number(limitMs)) return { ok: false, status: "FUTURE_TIME", reason: `Corrected raw time ${formatCorrectedElapsedInput(rawElapsedMs)} is later than the ${session.started ? "current" : "ended"} session elapsed time ${formatCorrectedElapsedInput(limitMs)}.` };
+  if (activeLapCountForStudent(studentId) >= getTargetPasses()) return { ok: false, status: RFID_STATUSES.ALREADY_FINISHED, reason: "Runner already has the maximum active laps. Void an incorrect lap before adding a replacement." };
+  const offsetSeconds = Number(getLockedRunnerSnapshot(studentId)?.start_offset_seconds || 0);
+  const adjustedElapsed = Number(rawElapsedMs) - offsetSeconds * 1000;
+  if (adjustedElapsed < 0) return { ok: false, status: RFID_STATUSES.BEFORE_WAVE_START, reason: `Corrected raw time is before the runner's ${offsetSeconds}s wave start.` };
+  const ev = buildCorrectionEvent(action, studentId, { requestedRawElapsedMs: Number(rawElapsedMs), appliedAdjustedElapsedMs: adjustedElapsed, relatedRawEventId: opts.relatedRawEventId || null, reason: String(opts.reason || "").trim() || null, source: "MANUAL" });
+  const lap = createAcceptedLapRecord(studentId, { sourceEventType: opts.source === "TAP" ? ACCEPTED_LAP_SOURCE_TYPES.MANUAL_TAP : ACCEPTED_LAP_SOURCE_TYPES.MANUAL_CORRECTION, sourceEventId: opts.source === "TAP" ? null : ev.correction_event_id, eventWallTimeIso: ev.created_wall_time_iso, eventPerfMs: ev.created_perf_ms, rawElapsedMs: Number(rawElapsedMs), adjustedElapsedMs: adjustedElapsed, source: "MANUAL", correctionEventId: ev.correction_event_id });
+  const finalEv = Object.freeze({ ...ev, created_lap_id: lap.lap_id });
+  session.correctionEvents.push(finalEv);
+  session.lastActionStack.push({ studentId, lapId: lap.lap_id, removedSplit: adjustedElapsed, index: activeLapCountForStudent(studentId)-1, source: "MANUAL", correctionEventId: finalEv.correction_event_id });
+  btnUndo.disabled = session.lastActionStack.length === 0;
+  rebuildSplitProjectionForStudent(studentId);
+  pushFeedItem(`<b>Manual lap</b> — ${s.name} — ${fmtTime(adjustedElapsed)}`);
+  renderGrid(); saveSessionSnapshot(getCorrectionSnapshotStatus());
+  return { ok: true, status: RFID_STATUSES.ACCEPTED, correctionEvent: finalEv, lap, adjustedElapsedMs: adjustedElapsed };
+}
+
+function manualAddCurrentLap(studentId, opts = {}) { return addManualLap(studentId, nowElapsedMs(), CORRECTION_ACTIONS.MANUAL_ADD_CURRENT, opts); }
+function manualAddCorrectedLap(studentId, rawElapsedMs, opts = {}) { return addManualLap(studentId, rawElapsedMs, CORRECTION_ACTIONS.MANUAL_ADD_CORRECTED, opts); }
+function manualAddCorrectedLapFromInput(studentId, text, opts = {}) { const p = parseCorrectedElapsedInput(text); return p.ok ? manualAddCorrectedLap(studentId, p.valueMs, opts) : { ok:false, status:"INVALID_TIME", reason:p.error }; }
+
+function voidAcceptedLap(lapId, opts = {}) {
+  const lap = (session.acceptedLaps || []).find(l => l.lap_id === lapId);
+  if (!lap) return { ok: false, status: "NOT_FOUND", reason: "Lap not found." };
+  if (lap.status !== ACCEPTED_LAP_STATUSES.ACTIVE || lap.voided === true) return { ok: true, duplicate: true, status: "ALREADY_VOIDED", reason: "Lap was already voided." };
+  const action = opts.quickUndo ? CORRECTION_ACTIONS.QUICK_UNDO : CORRECTION_ACTIONS.VOID_LAP;
+  const reason = String(opts.reason || (opts.quickUndo ? "Quick Undo" : "")).trim();
+  if (!reason) return { ok: false, status: "REASON_REQUIRED", reason: "Void reason is required." };
+  const ev = buildCorrectionEvent(action, lap.student_id, { requestedRawElapsedMs: lap.raw_elapsed_ms, appliedAdjustedElapsedMs: lap.adjusted_elapsed_ms, targetLapId: lap.lap_id, relatedRawEventId: opts.relatedRawEventId || null, reason, source: "MANUAL" });
+  session.correctionEvents.push(ev);
+  lap.status = opts.quickUndo ? ACCEPTED_LAP_STATUSES.LEGACY_UNDONE : ACCEPTED_LAP_STATUSES.VOIDED;
+  lap.voided = true; lap.correction_reason = reason; lap.undone_at_wall_time_iso = ev.created_wall_time_iso; lap.voided_at_wall_time_iso = ev.created_wall_time_iso;
+  rebuildSplitProjectionForStudent(lap.student_id);
+  renderGrid(); saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
+  return { ok: true, status: "VOIDED", correctionEvent: ev, lap };
 }
 
 function setPersistenceWarning(show) {
@@ -1384,6 +1525,9 @@ function buildSessionSnapshot(status) {
     dataById: serializeSessionDataById(),
     rawHardwareEvents: cloneRawHardwareEvents(session.rawHardwareEvents),
     acceptedLaps: cloneAcceptedLaps(session.acceptedLaps),
+    correctionEvents: cloneCorrectionEvents(session.correctionEvents),
+    correctionEventCounter: session.correctionEventCounter || 0,
+    correctionOperationIds: Array.from(session.correctionOperationIds || []),
     lastActionStack: session.lastActionStack.map(a => ({ ...a })),
     ui: {
       elapsedText: elElapsed ? elElapsed.textContent : "",
@@ -1485,6 +1629,10 @@ function applyRecoveredSessionSnapshot(snapshot) {
   session.lockedDebounceMs = sessionConfig.debounceMs;
   session.rawHardwareEvents = cloneRawHardwareEvents(snapshot.rawHardwareEvents);
   session.rawEventCounter = session.rawHardwareEvents.length;
+  session.correctionEvents = cloneCorrectionEvents(snapshot.correctionEvents);
+  session.correctionEventCounter = Number.isFinite(Number(snapshot.correctionEventCounter)) ? Number(snapshot.correctionEventCounter) : 0;
+  advanceCorrectionEventCounterFrom(session.correctionEvents);
+  session.correctionOperationIds = new Set(Array.isArray(snapshot.correctionOperationIds) ? snapshot.correctionOperationIds : []);
   session.persistenceFailed = false;
   restoreDataById(snapshot.dataById);
   session.acceptedLaps = Array.isArray(snapshot.acceptedLaps) ? normalizeAcceptedLapsForRecovery(snapshot.acceptedLaps) : migrateAcceptedLapsFromLegacySnapshot(snapshot);
@@ -1809,7 +1957,7 @@ tile.dataset.sid = s.id;
     times.textContent = displayLines.length ? displayLines.join("\n") : "—";
 
     tile.append(name, meta, times);
-    tile.addEventListener("click", () => recordPassByStudentId(s.id, { source: "TAP" }));
+    tile.addEventListener("click", () => manualAddCurrentLap(s.id, { source: "TAP" }));
     elGrid.appendChild(tile);
   }
 
@@ -1827,6 +1975,7 @@ function pushFeedItem(msg) {
 
 // ===== Core logic =====
 function recordPassByStudentId(studentId, { source, rawTagId, sourceEventId, eventWallTimeIso, eventPerfMs } = {}) {
+  if (source === "TAP" || source === "MANUAL") return manualAddCurrentLap(studentId, { source, rawTagId, relatedRawEventId: sourceEventId || null });
   if (!session.started) return { status: RFID_STATUSES.SESSION_NOT_STARTED, reason: "Session is not started.", acceptedSplitIndex: null };
 
   const target = getTargetPasses();
@@ -1996,6 +2145,9 @@ function startRun() {
   session.endedElapsedMs = null;
   session.acceptedLaps = [];
   session.acceptedLapCounter = 0;
+  session.correctionEvents = [];
+  session.correctionEventCounter = 0;
+  session.correctionOperationIds = new Set();
 
   btnStart.disabled = true;
   btnStop.disabled = false;
@@ -2043,12 +2195,7 @@ function undoLast() {
   if (!d || !s) return;
 
   const lap = (session.acceptedLaps || []).find(l => l.lap_id === action.lapId);
-  if (lap && lap.status === ACCEPTED_LAP_STATUSES.ACTIVE) {
-    lap.status = ACCEPTED_LAP_STATUSES.LEGACY_UNDONE;
-    lap.voided = true;
-    lap.undone_at_wall_time_iso = new Date().toISOString();
-  }
-  rebuildSplitProjectionForStudent(action.studentId);
+  if (lap) voidAcceptedLap(lap.lap_id, { quickUndo: true, reason: "Quick Undo" });
 
   pushFeedItem(`<b>Undo</b> — ${s.name} removed ${fmtTime(action.removedSplit)}`);
   btnUndo.disabled = session.lastActionStack.length === 0;
