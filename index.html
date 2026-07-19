@@ -660,11 +660,18 @@ button.big {
           <button id="btnClearRoster" class="secondary">Clear roster</button>
           <button id="btnSaveRoster" class="secondary">Save roster on this device</button>
           <button id="btnForgetRoster" class="secondary">Forget saved roster</button>
+          <button id="btnSampleRoster" class="secondary">Download sample V2 roster</button>
+          <button id="btnToggleRosterEditor" class="secondary">Edit roster</button>
           <button id="btnDiscardSessionSnapshot" class="secondary">Discard saved session</button>
         </div>
 
         <div class="hintRow small">
-          CSV headers must be: <code>tagId,name</code> (optional: <code>gender,age_group,email</code>)
+          V2 CSV headers: <code>runner_no,tag_id,name,class,start_offset_seconds,active</code>. Legacy <code>tagId,name</code> files are migrated automatically.
+        </div>
+        <div id="rosterEditor" class="hintRow small" style="display:none; flex-direction:column; align-items:stretch; gap:6px;">
+          <div><b>Roster editor</b>: edit CSV rows using <code>runner_no,tag_id,name,class,start_offset_seconds,active</code>.</div>
+          <textarea id="rosterEditorText" rows="6" style="width:100%; font-family:monospace;"></textarea>
+          <div><button id="btnApplyRosterEdits" class="secondary">Apply roster edits</button> <span id="rosterEditorStatus"></span></div>
         </div>
         <div class="hintRow small auditIndicator">
           RFID audit: total <span id="auditTotal">0</span> • accepted <span id="auditAccepted">0</span> • debounced <span id="auditDebounced">0</span> • too soon <span id="auditTooSoon">0</span> • unknown <span id="auditUnknown">0</span> • malformed <span id="auditMalformed">0</span>
@@ -891,7 +898,10 @@ function getMinLapMs() {
   return 15000;                  // default for shorter drills
 }
 
-const ROSTER_STORAGE_KEY = "runTimingRosterV1";
+const ROSTER_STORAGE_KEY_V1 = "runTimingRosterV1";
+const ROSTER_STORAGE_KEY_V2 = "runTimingRosterV2";
+const ROSTER_STORAGE_SCHEMA = "runTimingRosterV2";
+const ROSTER_STORAGE_SCHEMA_VERSION = 1;
 const SESSION_STORAGE_KEY = "runTimingSessionV2Stage1";
 const SESSION_STORAGE_SCHEMA_VERSION = 1;
 const SESSION_RECOVERY_MAX_WALL_GAP_MS = 12 * 60 * 60 * 1000; // 12 hours
@@ -907,6 +917,7 @@ const RFID_STATUSES = {
   MALFORMED: "MALFORMED",
   ALREADY_FINISHED: "ALREADY_FINISHED",
   SESSION_NOT_STARTED: "SESSION_NOT_STARTED",
+  INACTIVE_RUNNER: "INACTIVE_RUNNER",
 };
 
 // ===== Session preset support =====
@@ -927,7 +938,8 @@ function getPresetConfig(value) {
 }
 
 // ===== Roster (loaded from CSV) =====
-let students = []; // { id, name, tagId }
+let students = []; // V2: { id: runner_no string, runner_no, name, tagId, runner_class, start_offset_seconds, active }
+let tagToRunnerId = new Map();
 
 // ===== State =====
 let session = {
@@ -947,7 +959,40 @@ let session = {
   persistenceFailed: false,
 };
 
+function rebuildTagLookup() {
+  tagToRunnerId = new Map();
+  for (const s of students) {
+    if (s && s.active !== false && s.tagId) tagToRunnerId.set(String(s.tagId), String(s.id));
+  }
+}
+
+function normalizeStudentRecord(s, fallbackIndex) {
+  const runnerNo = s && (s.runner_no ?? s.runnerNo ?? s.id ?? fallbackIndex);
+  const id = String(runnerNo);
+  return {
+    ...s,
+    id,
+    runner_no: id,
+    tagId: String((s && (s.tagId ?? s.tag_id)) ?? ""),
+    name: String((s && s.name) ?? ""),
+    runner_class: String((s && (s.runner_class ?? s.class)) ?? ""),
+    start_offset_seconds: Number.isFinite(Number(s && (s.start_offset_seconds ?? s.startOffsetSeconds))) ? Number(s.start_offset_seconds ?? s.startOffsetSeconds) : 0,
+    active: s && Object.prototype.hasOwnProperty.call(s, "active") ? s.active !== false && String(s.active).toLowerCase() !== "false" : true,
+    gender: String((s && s.gender) || ""),
+    ageGroup: String((s && (s.ageGroup ?? s.age_group)) || ""),
+    email: String((s && s.email) || ""),
+  };
+}
+
+function setStudents(nextStudents) {
+  students = (Array.isArray(nextStudents) ? nextStudents : []).map((s, i) => normalizeStudentRecord(s, i + 1));
+  rebuildTagLookup();
+}
+
+function getActiveStudents() { return students.filter(s => s.active !== false); }
+
 function initSessionData() {
+  rebuildTagLookup();
   session.dataById.clear();
   for (const s of students) {
     session.dataById.set(s.id, {
@@ -1396,7 +1441,7 @@ function applyRecoveredSessionSnapshot(snapshot) {
   }
   const restoredElapsedMs = calculateRecoveredElapsedMs(snapshot, elapsedMsAtSave);
 
-  students = snapshot.students.map(s => ({ ...s }));
+  setStudents(snapshot.students.map(s => ({ ...s })));
   sessionConfig = { ...snapshot.sessionConfig };
   session.sessionId = snapshot.session.sessionId || makeSessionId();
   session.started = snapshot.status === "ACTIVE" && !!snapshot.session.started;
@@ -1531,6 +1576,12 @@ const btnClearRoster = document.getElementById("btnClearRoster");
 const btnSaveRoster = document.getElementById("btnSaveRoster");
 const btnForgetRoster = document.getElementById("btnForgetRoster");
 const btnDiscardSessionSnapshot = document.getElementById("btnDiscardSessionSnapshot");
+const btnSampleRoster = document.getElementById("btnSampleRoster");
+const btnToggleRosterEditor = document.getElementById("btnToggleRosterEditor");
+const btnApplyRosterEdits = document.getElementById("btnApplyRosterEdits");
+const rosterEditor = document.getElementById("rosterEditor");
+const rosterEditorText = document.getElementById("rosterEditorText");
+const rosterEditorStatus = document.getElementById("rosterEditorStatus");
 
 // New (optional) UI elements for presets/custom
 const sessionPreset = document.getElementById("sessionPreset");
@@ -1599,7 +1650,7 @@ function studentStateIndex(sid) {
 
 function renderCounters() {
   let n0 = 0, n1 = 0, n2 = 0, n3 = 0;
-  for (const s of students) {
+  for (const s of getActiveStudents()) {
     const st = studentStateIndex(s.id);
     if (st === 0) n0++;
     else if (st === 1) n1++;
@@ -1622,13 +1673,13 @@ function renderGrid() {
     empty.textContent = "No roster loaded yet. Upload a CSV to begin.";
     elGrid.appendChild(empty);
     renderCounters();
-    elRosterCount.textContent = "0";
+    elRosterCount.textContent = "0/0";
     return;
   }
 
   const target = getTargetPasses();
 
-  for (const s of students) {
+  for (const s of getActiveStudents()) {
     const d = session.dataById.get(s.id);
     const state = studentStateIndex(s.id);
     const progress = (d && d.splits) ? d.splits.length : 0;
@@ -1683,7 +1734,7 @@ tile.dataset.sid = s.id;
     elGrid.appendChild(tile);
   }
 
-  elRosterCount.textContent = String(students.length);
+  elRosterCount.textContent = `${getActiveStudents().length}/${students.length}`;
   renderCounters();
 }
 
@@ -1704,6 +1755,10 @@ function recordPassByStudentId(studentId, { source, rawTagId, sourceEventId, eve
   const s = students.find(x => x.id === studentId);
   const d = session.dataById.get(studentId);
   if (!s || !d) return { status: RFID_STATUSES.UNKNOWN_TAG, reason: "Student not found in current session data.", acceptedSplitIndex: null };
+  if (s.active === false) {
+    pushFeedItem(`<b>Inactive runner</b>: ${s.name || s.runner_no} — scan logged but not accepted.`);
+    return { status: RFID_STATUSES.INACTIVE_RUNNER, reason: "Runner is inactive in the current roster.", acceptedSplitIndex: null };
+  }
 
   if (d.splits.length >= target) {
     pushFeedItem(`<b>Ignored</b>: ${s.name} already finished.`);
@@ -1800,7 +1855,9 @@ function recordRfidKeyboardEvent(originalValue, capture) {
     return;
   }
 
-  const s = students.find(x => String(x.tagId) === clean);
+  const runnerId = tagToRunnerId.get(clean);
+  const inactive = students.find(x => x.active === false && String(x.tagId) === clean);
+  const s = runnerId ? students.find(x => String(x.id) === runnerId) : (students.find(x => x.active !== false && String(x.tagId) === clean) || inactive);
   if (!s) {
     pushFeedItem(`<b>Unknown tag</b>: ${clean}`);
     finalizeRawHardwareEvent(event, RFID_STATUSES.UNKNOWN_TAG, "Tag was not found in the roster.", null, null);
@@ -1827,8 +1884,8 @@ function startRun() {
     if (!replaceCorrupt) return;
   }
 
-  if (students.length === 0) {
-    alert("Please load a roster CSV first.");
+  if (getActiveStudents().length === 0) {
+    alert("Please load at least one active runner in the roster CSV first.");
     return;
   }
 
@@ -1943,7 +2000,7 @@ function exportCsv() {
   header.push("status");
   rows.push(header);
 
-  for (const s of students) {
+  for (const s of getActiveStudents()) {
     const d = session.dataById.get(s.id);
     const t = (d && d.splits) ? d.splits : [];
 
@@ -2087,20 +2144,14 @@ csvFile.addEventListener("change", async (e) => {
   if (!file) return;
 
   const text = await file.text();
-  const loaded = parseRosterCsv(text);
-
-  students = loaded.map((r) => ({
-    id: r.tagId,   // simplest: use tagId as id
-    name: (r.name && String(r.name).trim()) ? String(r.name).trim() : r.tagId,
-    tagId: r.tagId,
-    gender: r.gender || "",
-    ageGroup: r.age_group || "",
-    email: r.email || "",
-  }));
-
-  initSessionData();
-  renderGrid();
-  pushFeedItem(`<b>Roster loaded</b> — ${students.length} students`);
+  const result = parseRosterCsv(text);
+  if (!result.ok) {
+    alert(result.report.join("\n"));
+    pushFeedItem(`<b>Roster rejected</b> — ${escapeHtml(result.report[0] || "validation failed")}`);
+    csvFile.value = "";
+    return;
+  }
+  applyRoster(result.students, { message: result.message });
   csvFile.value = "";
 });
 
@@ -2116,14 +2167,37 @@ btnSaveRoster.addEventListener("click", () => {
     alert("No roster loaded to save.");
     return;
   }
-  localStorage.setItem(ROSTER_STORAGE_KEY, JSON.stringify(students));
+  saveRosterToStorage();
   pushFeedItem(`<b>Roster saved</b> on this device`);
 });
 
 btnForgetRoster.addEventListener("click", () => {
-  localStorage.removeItem(ROSTER_STORAGE_KEY);
-  pushFeedItem(`<b>Saved roster removed</b> from this device`);
+  localStorage.removeItem(ROSTER_STORAGE_KEY_V2);
+  pushFeedItem(`<b>Saved V2 roster removed</b> from this device; legacy V1 roster was not changed.`);
 });
+
+if (btnSampleRoster) {
+  btnSampleRoster.addEventListener("click", () => download("sample_v2_roster.csv", sampleV2RosterCsv()));
+}
+if (btnToggleRosterEditor) {
+  btnToggleRosterEditor.addEventListener("click", () => {
+    const show = !rosterEditor || rosterEditor.style.display === "none";
+    if (rosterEditor) rosterEditor.style.display = show ? "flex" : "none";
+    if (show) renderRosterEditor();
+  });
+}
+if (btnApplyRosterEdits) {
+  btnApplyRosterEdits.addEventListener("click", () => {
+    const parsed = parseRosterCsv(rosterEditorText ? rosterEditorText.value : "");
+    if (!parsed.ok) {
+      if (rosterEditorStatus) rosterEditorStatus.textContent = parsed.report[0] || "Roster edit rejected.";
+      pushFeedItem(`<b>Roster edit rejected</b> — ${escapeHtml(parsed.report[0] || "validation failed")}`);
+      return;
+    }
+    const result = editRoster(parsed.students);
+    if (rosterEditorStatus) rosterEditorStatus.textContent = result.ok ? "Roster edits applied." : (result.report[0] || "Roster edit rejected.");
+  });
+}
 
 if (btnDiscardSessionSnapshot) {
   btnDiscardSessionSnapshot.addEventListener("click", () => {
@@ -2135,38 +2209,192 @@ if (btnDiscardSessionSnapshot) {
 }
 
 
-function parseRosterCsv(text) {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  if (lines.length < 2) return [];
+function rosterTagNormalizeForImport(value) {
+  const original = String(value == null ? "" : value).trim();
+  if (/^\d{1,4}$/.test(original)) return original.padStart(4, "0");
+  return original;
+}
 
-  const headers = splitCsvLine(lines[0]).map(h => h.trim().toLowerCase());
-  const idxTag = headers.indexOf("tagid") !== -1 ? headers.indexOf("tagid") : (headers.indexOf("tag_id") !== -1 ? headers.indexOf("tag_id") : headers.indexOf("id"));
-  const idxName = headers.indexOf("name");
+function parseActiveValue(value) {
+  const v = String(value == null ? "" : value).trim().toLowerCase();
+  if (["true", "yes", "1"].includes(v)) return true;
+  if (["false", "no", "0"].includes(v)) return false;
+  return null;
+}
 
-  const idxGender = headers.indexOf("gender") !== -1 ? headers.indexOf("gender") : (headers.indexOf("g") !== -1 ? headers.indexOf("g") : headers.indexOf("sex"));
-  const idxAge = headers.indexOf("age_group") !== -1 ? headers.indexOf("age_group") : (headers.indexOf("agegroup") !== -1 ? headers.indexOf("agegroup") : headers.indexOf("age"));
-  const idxEmail = headers.indexOf("email");
-
-  if (idxTag === -1 || idxName === -1) {
-    alert("CSV must have headers: tagId,name (optional: gender,age_group,email)");
-    return [];
-  }
-
+function validateRosterRows(rows, options) {
+  const errors = [];
+  const runnerNos = new Set();
+  const tags = new Set();
   const out = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = splitCsvLine(lines[i]);
-    const tagId = ((cols[idxTag] == null) ? "" : cols[idxTag]).trim();
-    let name  = ((cols[idxName] == null) ? "" : cols[idxName]).trim();
-    if (!tagId) continue;
-    if (!name) name = tagId;
+  rows.forEach((r, i) => {
+    const rowNo = r.__rowNo || (i + 2);
+    const runnerNoText = String(r.runner_no ?? "").trim();
+    const rn = Number(runnerNoText);
+    if (!/^\d+$/.test(runnerNoText) || rn <= 0) errors.push(`Row ${rowNo}: runner_no is required and must be a positive integer.`);
+    if (runnerNos.has(runnerNoText)) errors.push(`Row ${rowNo}: duplicate runner_no ${runnerNoText}.`);
+    runnerNos.add(runnerNoText);
+    const active = typeof r.active === "boolean" ? r.active : parseActiveValue(r.active);
+    if (active == null) errors.push(`Row ${rowNo}: active is required and must be true/false, yes/no or 1/0.`);
+    const offset = Number(String(r.start_offset_seconds ?? "").trim());
+    if (!Number.isFinite(offset) || offset < 0) errors.push(`Row ${rowNo}: start_offset_seconds is required, numeric and non-negative.`);
+    const tagOriginal = String(r.tag_id ?? r.tagId ?? "").trim();
+    const tagId = rosterTagNormalizeForImport(tagOriginal);
+    if (active === true && !tagId) errors.push(`Row ${rowNo}: tag_id is required for active runners.`);
+    if (tagId && !/^\d{4}$/.test(tagId)) errors.push(`Row ${rowNo}: tag_id "${tagOriginal}" is incompatible with the current four-digit SM206 profile.`);
+    if (tagId) {
+      if (tags.has(tagId)) errors.push(`Row ${rowNo}: duplicate tag_id ${tagId} after normalisation.`);
+      tags.add(tagId);
+    }
+    out.push(normalizeStudentRecord({
+      id: runnerNoText,
+      runner_no: runnerNoText,
+      tagId,
+      tag_id_original: tagOriginal,
+      name: String(r.name ?? "").trim(),
+      runner_class: String(r.class ?? r.runner_class ?? "").trim(),
+      start_offset_seconds: offset,
+      active: active === true,
+      gender: r.gender || "",
+      ageGroup: r.age_group || r.ageGroup || "",
+      email: r.email || "",
+    }, i + 1));
+  });
+  return { ok: errors.length === 0, students: out, report: errors.length ? errors : [`Roster valid: ${out.length} records (${out.filter(s => s.active !== false).length} active).`] };
+}
 
-    const gender = (idxGender !== -1 && cols[idxGender] != null) ? String(cols[idxGender]).trim() : "";
-    const age_group = (idxAge !== -1 && cols[idxAge] != null) ? String(cols[idxAge]).trim() : "";
-    const email = (idxEmail !== -1 && cols[idxEmail] != null) ? String(cols[idxEmail]).trim() : "";
-
-    out.push({ tagId, name, gender, age_group, email });
+function parseRosterCsv(text) {
+  const rawLines = String(text || "").split(/\r?\n/).filter(l => l.trim() !== "");
+  if (rawLines.length < 2) return { ok: false, students: [], report: ["CSV must include a header row and at least one data row."] };
+  if (rawLines.length - 1 > 120) return { ok: false, students: [], report: ["Roster supports 1–120 imported records."] };
+  const headers = splitCsvLine(rawLines[0]).map(h => h.trim().toLowerCase());
+  const idx = (names) => names.map(n => headers.indexOf(n)).find(i => i !== -1) ?? -1;
+  const idxRunner = idx(["runner_no", "runnerno", "runner", "student_id"]);
+  const idxTag = idx(["tag_id", "tagid", "id"]);
+  const idxName = idx(["name", "student_name", "student"]);
+  const idxClass = idx(["class", "runner_class", "class_code"]);
+  const idxOffset = idx(["start_offset_seconds"]);
+  const idxActive = idx(["active"]);
+  const idxGender = idx(["gender", "g", "sex"]);
+  const idxAge = idx(["age_group", "agegroup", "age"]);
+  const idxEmail = idx(["email"]);
+  const isV2 = idxRunner !== -1 && idxTag !== -1 && idxOffset !== -1 && idxActive !== -1;
+  if (idxTag === -1) return { ok: false, students: [], report: ["CSV must include tag_id/tagId/id."] };
+  const rows = [];
+  for (let i = 1; i < rawLines.length; i++) {
+    const cols = splitCsvLine(rawLines[i]);
+    const tag = idxTag !== -1 && cols[idxTag] != null ? cols[idxTag] : "";
+    const runner = isV2 ? (idxRunner !== -1 && cols[idxRunner] != null ? cols[idxRunner] : "") : (idxRunner !== -1 && cols[idxRunner] != null && String(cols[idxRunner]).trim() ? cols[idxRunner] : String(i));
+    rows.push({ __rowNo: i + 1, runner_no: runner, tag_id: tag, name: idxName !== -1 ? cols[idxName] : "", class: idxClass !== -1 ? cols[idxClass] : "", start_offset_seconds: isV2 ? cols[idxOffset] : "0", active: isV2 ? cols[idxActive] : "true", gender: idxGender !== -1 ? cols[idxGender] : "", age_group: idxAge !== -1 ? cols[idxAge] : "", email: idxEmail !== -1 ? cols[idxEmail] : "" });
   }
-  return out;
+  const validated = validateRosterRows(rows, { v2: isV2 });
+  validated.message = isV2 ? "Roster loaded" : "Legacy roster migrated to V2 defaults (runner_no, offset 0, active true).";
+  return validated;
+}
+
+function applyRoster(nextStudents, opts = {}) {
+  const previous = students.map(s => ({ ...s }));
+  setStudents(nextStudents);
+  initSessionData();
+  renderGrid();
+  const saved = saveRosterToStorage();
+  renderRosterEditor();
+  pushFeedItem(`<b>${escapeHtml(opts.message || "Roster loaded")}</b> — ${students.length} records, ${getActiveStudents().length} active${saved ? "" : " (not saved)"}`);
+  return previous;
+}
+
+function buildRosterStorageEnvelope(records) {
+  return {
+    schema: ROSTER_STORAGE_SCHEMA,
+    schemaVersion: ROSTER_STORAGE_SCHEMA_VERSION,
+    savedAtWallTimeIso: new Date().toISOString(),
+    students: (Array.isArray(records) ? records : students).map(s => ({ ...s })),
+  };
+}
+
+function parseSavedRosterEnvelope(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.schema === ROSTER_STORAGE_SCHEMA && parsed.schemaVersion === ROSTER_STORAGE_SCHEMA_VERSION && Array.isArray(parsed.students)) {
+      const validated = validateRosterRows(parsed.students.map((s, i) => ({
+        __rowNo: i + 1, runner_no: s.runner_no ?? s.id, tag_id: s.tagId ?? s.tag_id, name: s.name, class: s.runner_class ?? s.class, start_offset_seconds: s.start_offset_seconds, active: s.active, gender: s.gender, age_group: s.ageGroup ?? s.age_group, email: s.email
+      })), { v2: true });
+      if (validated.ok) return { ok: true, students: validated.students, source: "v2" };
+    }
+  } catch (e) {}
+  return { ok: false, students: [], source: "v2" };
+}
+
+function migrateLegacySavedRoster(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || !parsed.length) return { ok: false, students: [], source: "v1" };
+    const rows = parsed.map((s, i) => ({ __rowNo: i + 1, runner_no: s.runner_no ?? s.runnerNo ?? String(i + 1), tag_id: s.tagId ?? s.tag_id ?? s.id ?? "", name: s.name ?? "", class: s.runner_class ?? s.class ?? "", start_offset_seconds: "0", active: "true", gender: s.gender || "", age_group: s.ageGroup ?? s.age_group ?? "", email: s.email || "" }));
+    const validated = validateRosterRows(rows, { v2: false });
+    if (validated.ok) return { ok: true, students: validated.students, source: "v1" };
+  } catch (e) {}
+  return { ok: false, students: [], source: "v1" };
+}
+
+function loadSavedRosterFromStorage() {
+  const v2Raw = localStorage.getItem(ROSTER_STORAGE_KEY_V2);
+  if (v2Raw) {
+    const v2 = parseSavedRosterEnvelope(v2Raw);
+    return v2.ok ? v2 : null;
+  }
+  const v1Raw = localStorage.getItem(ROSTER_STORAGE_KEY_V1);
+  if (v1Raw) {
+    const migrated = migrateLegacySavedRoster(v1Raw);
+    if (migrated.ok) {
+      setStudents(migrated.students);
+      saveRosterToStorage();
+      return migrated;
+    }
+  }
+  return null;
+}
+
+function saveRosterToStorage() {
+  try { localStorage.setItem(ROSTER_STORAGE_KEY_V2, JSON.stringify(buildRosterStorageEnvelope(students))); return true; }
+  catch (e) { setPersistenceWarning(true); pushFeedItem(`<b>Warning</b>: V2 roster was not saved on this device.`); return false; }
+}
+
+function rosterRowsToCsv(records) {
+  const rows = [["runner_no","tag_id","name","class","start_offset_seconds","active"]];
+  for (const s of Array.isArray(records) ? records : students) rows.push([s.runner_no || s.id || "", s.tagId || "", s.name || "", s.runner_class || "", Number.isFinite(Number(s.start_offset_seconds)) ? Number(s.start_offset_seconds) : 0, s.active === false ? "false" : "true"]);
+  return makeCsv(rows);
+}
+
+function renderRosterEditor() {
+  if (rosterEditorText) rosterEditorText.value = rosterRowsToCsv(students);
+  if (rosterEditorStatus) rosterEditorStatus.textContent = students.length ? `${students.length} records loaded.` : "No roster loaded.";
+}
+
+function editRoster(updatedRows) {
+  const validated = validateRosterRows(updatedRows.map((r, i) => ({ ...r, __rowNo: i + 1 })), { v2: true });
+  if (!validated.ok) return validated;
+  if (session.started) {
+    const ok = window.confirm("Apply roster edits during an active session? Future scans use updated tags. Prior raw events and accepted-lap snapshots remain unchanged.");
+    if (!ok) return { ok: false, students, report: ["Roster edit cancelled."] };
+  }
+  setStudents(validated.students);
+  for (const s of students) if (!session.dataById.has(s.id)) session.dataById.set(s.id, { splits: [], lastScanAtPerf: -Infinity });
+  rebuildAllSplitProjections();
+  renderGrid();
+  saveRosterToStorage();
+  renderRosterEditor();
+  saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
+  return validated;
+}
+
+function sampleV2RosterCsv() {
+  return makeCsv([
+    ["runner_no","tag_id","name","class","start_offset_seconds","active"],
+    ["1","0001","Sample Runner A","Demo",0,"true"],
+    ["2","0012","Sample Runner B","Demo",10,"yes"],
+    ["3","0103","","",20,"1"],
+    ["4","0004","Inactive Example","Demo",0,"false"],
+  ]);
 }
 
 function splitCsvLine(line) {
@@ -3751,15 +3979,10 @@ if (btnPrintClass) {
   }
   updateSendClassButtonLabel();
 
-  // try load saved roster
-  const saved = localStorage.getItem(ROSTER_STORAGE_KEY);
-  if (saved) {
-    try {
-      const parsed = JSON.parse(saved);
-      if (Array.isArray(parsed) && parsed.length) {
-        students = parsed;
-      }
-    } catch (e) {}
+  // try load saved V2 roster first; V1 is read-only legacy fallback
+  const savedRoster = loadSavedRosterFromStorage();
+  if (savedRoster && savedRoster.ok) {
+    setStudents(savedRoster.students);
   }
 
   initSessionData();
