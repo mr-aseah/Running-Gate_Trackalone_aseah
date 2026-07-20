@@ -175,6 +175,41 @@ button.secondary { font-weight: 700; }
   font-weight: 800;
 }
 
+
+/* ===== Stage 7 compact high-volume capture dashboard ===== */
+.grid { margin-top: 12px; display: grid; gap: 10px; grid-template-columns: 1fr; }
+.captureDashboard { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 12px; align-items: start; }
+.runnerBlocks { display: grid; gap: 12px; min-width: 0; }
+.runnerBlock { scroll-margin-top: 96px; }
+.runnerBlockTitle { font-weight: 900; font-size: 13px; color: #334155; margin: 0 0 6px; }
+.runnerBlockColumns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.runnerColumn { display: grid; gap: 5px; align-content: start; }
+.runnerStrip { background: white; border: 2px solid #e5e7eb; border-left-width: 8px; border-radius: 10px; padding: 7px 8px; cursor: pointer; user-select: none; min-height: 42px; display: grid; grid-template-columns: 48px 54px 1fr 1fr auto; gap: 6px; align-items: center; font-size: 13px; font-variant-numeric: tabular-nums; }
+.runnerStrip:focus { outline: 3px solid #0ea5e9; outline-offset: 1px; }
+.stripRunnerNo { font-weight: 1000; }
+.stripLap, .stripLatest, .stripTotal { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stripStatus { border-radius: 999px; padding: 2px 7px; font-size: 11px; font-weight: 900; white-space: nowrap; }
+.status-not-started { border-color: #94a3b8; background: #f8fafc; }
+.status-not-started .stripStatus { background: #e2e8f0; color: #334155; }
+.status-active { border-color: #2563eb; background: #eff6ff; }
+.status-active .stripStatus { background: #dbeafe; color: #1d4ed8; }
+.status-needs-checking { border-color: #f59e0b; background: #fffbeb; }
+.status-needs-checking .stripStatus { background: #fef3c7; color: #92400e; }
+.status-confirmed-issue { border-color: #dc2626; background: #fef2f2; }
+.status-confirmed-issue .stripStatus { background: #fee2e2; color: #991b1b; }
+.status-completed { border-color: #10b981; background: #ecfdf5; }
+.status-completed .stripStatus { background: #d1fae5; color: #065f46; }
+.jumpControls { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.jumpControl { padding: 7px 9px; border-radius: 999px; font-size: 12px; }
+.jumpControl.active { background: #0f172a; color: #fff; border-color: #0f172a; }
+.recentScansPanel { position: sticky; top: 88px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 10px; }
+.recentScansList { display: grid; gap: 6px; }
+.recentScanRow { border: 1px solid #e5e7eb; border-left: 5px solid #3b82f6; border-radius: 9px; padding: 7px; background: #fff; text-align: left; font-size: 12px; font-weight: 800; display: grid; gap: 2px; width: 100%; }
+.recentScanRow.newest { background: #ecfeff; }
+.recentScanMeta { color: #475569; font-weight: 700; }
+@media (max-width: 1050px) { .captureDashboard { grid-template-columns: 1fr; } .recentScansPanel { position: static; } }
+@media (max-width: 720px) { .runnerBlockColumns { grid-template-columns: 1fr; } .runnerStrip { grid-template-columns: 42px 48px 1fr; } .stripTotal, .stripStatus { grid-column: auto; } }
+
 /* ===== Analytics Modal ===== */
 .modal {
   position: fixed;
@@ -1582,6 +1617,12 @@ function buildAcceptedScanProjectionRows(studentId) {
     const active = activeByLapId.get(lap.lap_id);
     return {
       session_id: lap.session_id,
+      student_id: lap.student_id || "",
+      event_wall_time_iso: lap.event_wall_time_iso || "",
+      event_perf_ms: lap.event_perf_ms,
+      adjusted_elapsed_ms: lap.adjusted_elapsed_ms,
+      source_event_type: lap.source_event_type || "",
+      required_lap_count: getTargetPasses(),
       runner_no: lap.runner_no || "",
       tag_id: lap.tag_id || "",
       name: lap.name || "",
@@ -2096,84 +2137,124 @@ function openRunnerActionPanel(studentId) {
   elRunnerActionPanel.querySelector("button, input, textarea").focus();
 }
 
+function compareRunnerStable(a, b) {
+  const an = Number(a && a.runner_no), bn = Number(b && b.runner_no);
+  const afin = Number.isFinite(an), bfin = Number.isFinite(bn);
+  if (afin && bfin && an !== bn) return an - bn;
+  if (afin !== bfin) return afin ? -1 : 1;
+  return String((a && (a.runner_no || a.id)) || "").localeCompare(String((b && (b.runner_no || b.id)) || ""), undefined, { numeric: true }) || String((a && a.name) || "").localeCompare(String((b && b.name) || ""));
+}
+
+function fmtTimeMs(ms) { return Number.isFinite(Number(ms)) ? formatCorrectedElapsedInput(Number(ms)) : "—"; }
+
+const RUNNER_STATUS_RULES = Object.freeze({
+  NOT_STARTED: { key: "not-started", label: "Not started", mark: "○" },
+  ACTIVE: { key: "active", label: "Active", mark: "▶" },
+  NEEDS_CHECKING: { key: "needs-checking", label: "Check", mark: "!" },
+  CONFIRMED_ISSUE: { key: "confirmed-issue", label: "Issue", mark: "✖" },
+  COMPLETED: { key: "completed", label: "Done", mark: "✓" },
+});
+const RECOVERABLE_RUNNER_REJECTIONS = new Set([RFID_STATUSES.DEBOUNCED, RFID_STATUSES.TOO_SOON, RFID_STATUSES.BEFORE_WAVE_START]);
+const STRONG_RUNNER_REJECTIONS = new Set([RFID_STATUSES.ALREADY_FINISHED, RFID_STATUSES.INACTIVE_RUNNER]);
+
+function eventTimeValue(ev) {
+  const p = Number(ev && (ev.captured_perf_ms ?? ev.event_perf_ms ?? ev.created_perf_ms));
+  if (Number.isFinite(p)) return p;
+  const t = Date.parse(String(ev && (ev.captured_wall_time_iso || ev.event_wall_time_iso || ev.created_wall_time_iso) || ""));
+  return Number.isFinite(t) ? t : 0;
+}
+
+function getRunnerDashboardStatus(studentId) {
+  const active = getActiveAcceptedLapsForStudent(studentId);
+  const latestAcceptedTime = active.length ? eventTimeValue(active[active.length - 1]) : -Infinity;
+  const latestCorrectionTime = (session.correctionEvents || []).filter(e => e && e.student_id === studentId && e.status !== CORRECTION_STATUSES.REJECTED).reduce((m, e) => Math.max(m, eventTimeValue(e)), -Infinity);
+  const latestReject = (session.rawHardwareEvents || []).filter(e => e && e.student_id === studentId && e.processing_status !== RFID_STATUSES.ACCEPTED).sort((a,b) => eventTimeValue(b) - eventTimeValue(a))[0] || null;
+  const clearTime = Math.max(latestAcceptedTime, latestCorrectionTime);
+  if (latestReject && eventTimeValue(latestReject) > clearTime) {
+    if (STRONG_RUNNER_REJECTIONS.has(latestReject.processing_status)) return RUNNER_STATUS_RULES.CONFIRMED_ISSUE;
+    if (RECOVERABLE_RUNNER_REJECTIONS.has(latestReject.processing_status)) return RUNNER_STATUS_RULES.NEEDS_CHECKING;
+  }
+  if (active.length >= getTargetPasses()) return RUNNER_STATUS_RULES.COMPLETED;
+  if (active.length > 0) return RUNNER_STATUS_RULES.ACTIVE;
+  return RUNNER_STATUS_RULES.NOT_STARTED;
+}
+
+function buildRunnerStrip(s) {
+  const summary = getRunnerTimingSummary(s.id);
+  const status = getRunnerDashboardStatus(s.id);
+  const strip = document.createElement("button");
+  strip.type = "button";
+  strip.className = `runnerStrip status-${status.key}`;
+  strip.dataset.sid = s.id;
+  if (strip.setAttribute) strip.setAttribute("aria-label", `Open actions for runner ${s.runner_no || s.id}; status ${status.label}`);
+  const parts = [
+    ["stripRunnerNo", `R${s.runner_no || s.id}`],
+    ["stripLap", `L${Math.min(summary.completed, summary.required)}/${summary.required}`],
+    ["stripLatest", `Lap ${fmtTimeMs(summary.latestLapMs)}`],
+    ["stripTotal", `Total ${fmtTimeMs(summary.latestAdjustedMs)}`],
+    ["stripStatus", `${status.mark} ${status.label}`],
+  ];
+  parts.forEach(([cls, text]) => { const span = document.createElement("span"); span.className = cls; span.textContent = text; if (cls === "stripStatus" && span.setAttribute) span.setAttribute("aria-label", `Status: ${status.label}`); strip.appendChild(span); });
+  strip.addEventListener("click", () => openRunnerActionPanel(s.id));
+  strip.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openRunnerActionPanel(s.id); } });
+  return strip;
+}
+
+function renderRecentScans(container) {
+  const panel = document.createElement("aside");
+  panel.className = "recentScansPanel";
+  const title = document.createElement("div"); title.className = "panelTitle"; title.textContent = "Recent accepted scans";
+  const list = document.createElement("div"); list.id = "recentScansList"; list.className = "recentScansList";
+  panel.append(title, list);
+  const rows = buildAcceptedScanProjectionRows().filter(r => r.status === ACCEPTED_LAP_STATUSES.ACTIVE && r.voided !== true).slice().sort((a,b) => eventTimeValue(b) - eventTimeValue(a) || String(b.lap_id||"").localeCompare(String(a.lap_id||""))).slice(0, 10);
+  if (!rows.length) {
+    const empty = document.createElement("div"); empty.className = "panelBody"; empty.textContent = "No accepted scans yet."; list.appendChild(empty);
+  }
+  rows.forEach((r, i) => {
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = `recentScanRow ${i === 0 ? "newest" : ""}`; btn.dataset.sid = r.student_id;
+    const line = document.createElement("span"); line.textContent = r.event_wall_time_iso || "no clock time";
+    const meta = document.createElement("span"); meta.className = "recentScanMeta"; meta.textContent = `R${r.runner_no} • ${r.tag_id || "—"} • L${r.lap_number}/${r.required_lap_count} • ${r.source === "SCAN" ? "RFID" : (r.source || "MANUAL")}`;
+    btn.append(line, meta);
+    btn.addEventListener("click", () => openRunnerActionPanel(r.student_id));
+    list.appendChild(btn);
+  });
+  container.appendChild(panel);
+}
+
+function renderJumpControls(blockCount) {
+  const wrap = document.createElement("div");
+  wrap.className = "jumpControls";
+  for (let i = 0; i < blockCount; i++) {
+    const start = i * 40 + 1, end = (i + 1) * 40;
+    const b = document.createElement("button"); b.type = "button"; b.className = `jumpControl ${i === 0 ? "active" : ""}`; b.textContent = `Runners ${start}–${end}`; b.dataset.target = `runner-block-${i+1}`;
+    b.addEventListener("click", () => { const target = document.getElementById(b.dataset.target); if (target && target.scrollIntoView) target.scrollIntoView({ block: "start" }); Array.from(wrap.children).forEach(x => x.classList.remove("active")); b.classList.add("active"); if (session.started) setTimeout(focusScanInput, 0); });
+    wrap.appendChild(b);
+  }
+  return wrap;
+}
+
 function renderGrid() {
   elGrid.innerHTML = "";
-
-  if (students.length === 0) {
-    const empty = document.createElement("div");
-    empty.style.padding = "14px";
-    empty.style.color = "#444";
-    empty.textContent = "No roster loaded yet. Upload a CSV to begin.";
-    elGrid.appendChild(empty);
-    renderCounters();
-    elRosterCount.textContent = "0/0";
-    return;
+  const active = getActiveStudents().slice().sort(compareRunnerStable);
+  if (active.length === 0) {
+    const empty = document.createElement("div"); empty.style.padding = "14px"; empty.style.color = "#444"; empty.textContent = students.length ? "No active runners in this roster." : "No roster loaded yet. Upload a CSV to begin."; elGrid.appendChild(empty); renderCounters(); elRosterCount.textContent = `0/${students.length}`; return;
   }
-
-  const target = getTargetPasses();
-
-  for (const s of getActiveStudents()) {
-    const d = session.dataById.get(s.id);
-    const state = studentStateIndex(s.id);
-    const progress = (d && d.splits) ? d.splits.length : 0;
-
-const tile = document.createElement("div");
-tile.className = `tile state${state}`;
-
-// Special colour coding for 4-rep sessions (e.g., 4×600m)
-if (target === 4) {
-  if (progress === 1) tile.classList.add("stage4_1");
-  else if (progress === 2) tile.classList.add("stage4_2");
-}
-
-tile.dataset.sid = s.id;
-tile.tabIndex = 0;
-if (tile.setAttribute) {
-  tile.setAttribute("role", "button");
-  tile.setAttribute("aria-label", `Open actions for runner ${s.runner_no || s.id}`);
-}
-
-    const name = document.createElement("div");
-    name.className = "name";
-    name.textContent = s.name;
-
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const left = document.createElement("span");
-    left.textContent = `${Math.min(progress, target)}/${target}`;
-    const right = document.createElement("span");
-    right.textContent = s.tagId;
-    meta.append(left, right);
-
-    const times = document.createElement("div");
-    times.className = "times";
-
-    const splits = (d && d.splits) ? d.splits : [];
-    const lines = [];
-
-    // Build lines for each recorded pass
-    for (let i = 0; i < splits.length; i++) {
-      const ti = splits[i];
-      const seg = (i === 0) ? ti : (ti - splits[i - 1]);
-      const tag = (i + 1 === target) ? "FINISH" : `t${i + 1}`;
-      lines.push(`${tag} ${fmtTime(ti)} | Rep${i + 1} ${fmtTime(seg)}`);
-    }
-
-    // Keep tile readable for 8×200: show first 2 + last 2 if long
-    let displayLines = lines;
-    if (lines.length > 4) {
-      displayLines = [...lines.slice(0, 2), "…", ...lines.slice(-2)];
-    }
-
-    times.textContent = displayLines.length ? displayLines.join("\n") : "—";
-
-    tile.append(name, meta, times);
-    tile.addEventListener("click", () => openRunnerActionPanel(s.id));
-    tile.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openRunnerActionPanel(s.id); } });
-    elGrid.appendChild(tile);
+  const dashboard = document.createElement("section"); dashboard.className = "captureDashboard"; dashboard.dataset.sid = active[0].id; dashboard.addEventListener("click", e => { if (e && e.target === dashboard) openRunnerActionPanel(active[0].id); });
+  const left = document.createElement("div"); left.className = "runnerBlocks";
+  const blockCount = Math.ceil(active.length / 40);
+  left.appendChild(renderJumpControls(blockCount));
+  for (let b = 0; b < blockCount; b++) {
+    const block = document.createElement("section"); block.className = "runnerBlock"; block.id = `runner-block-${b+1}`;
+    block.innerHTML = `<h3 class="runnerBlockTitle">Roster positions ${b*40+1}–${Math.min((b+1)*40, active.length)}</h3>`;
+    const cols = document.createElement("div"); cols.className = "runnerBlockColumns";
+    const cLeft = document.createElement("div"), cMid = document.createElement("div"); cLeft.className = cMid.className = "runnerColumn";
+    active.slice(b*40, b*40+20).forEach(r => cLeft.appendChild(buildRunnerStrip(r)));
+    active.slice(b*40+20, b*40+40).forEach(r => cMid.appendChild(buildRunnerStrip(r)));
+    cols.append(cLeft, cMid); block.appendChild(cols); left.appendChild(block);
   }
-
-  elRosterCount.textContent = `${getActiveStudents().length}/${students.length}`;
+  dashboard.appendChild(left); renderRecentScans(dashboard); elGrid.appendChild(dashboard);
+  elRosterCount.textContent = `${active.length}/${students.length}`;
   renderCounters();
 }
 
@@ -2286,6 +2367,7 @@ function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSpli
   event.accepted_split_index = Number.isInteger(acceptedSplitIndex) ? acceptedSplitIndex : null;
   session.rawHardwareEvents.push(event);
   renderAuditIndicator();
+  if (studentId) renderGrid();
   saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
 }
 
