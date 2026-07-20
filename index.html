@@ -113,6 +113,34 @@ button.secondary { font-weight: 700; }
 .feedItem { border: 1px solid #eee; border-radius: 10px; padding: 8px; font-size: 12px; }
 .feedItem b { font-size: 13px; }
 
+.runnerActionPanel {
+  margin-top: 12px;
+  background: #fff;
+  border: 2px solid #0f172a;
+  border-radius: 14px;
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  max-width: 760px;
+}
+.runnerActionHeader { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+.runnerActionTitle { font-weight: 900; font-size: 18px; }
+.runnerSummaryGrid { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 8px; font-size: 12px; }
+.runnerSummaryGrid div { border: 1px solid #e5e7eb; border-radius: 10px; padding: 7px; background: #f8fafc; }
+.runnerActions { display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)); gap: 10px; }
+.runnerActionBox { border: 1px solid #e5e7eb; border-radius: 12px; padding: 10px; display: grid; gap: 8px; align-content: start; }
+.runnerActionBox label { display: grid; gap: 4px; font-size: 12px; font-weight: 800; }
+.runnerActionBox input, .runnerActionBox textarea { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-family: inherit; }
+.runnerPanelMessage { border-radius: 10px; padding: 8px; font-size: 13px; font-weight: 800; background: #f1f5f9; }
+.runnerPanelMessage.ok { background: #dcfce7; color: #14532d; }
+.runnerPanelMessage.err { background: #fee2e2; color: #7f1d1d; }
+.runnerHistory { max-height: 220px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 10px; }
+.runnerHistoryItem { padding: 7px 8px; border-bottom: 1px solid #eef2f7; font-size: 12px; }
+.runnerHistoryItem:last-child { border-bottom: 0; }
+.runnerHistoryItem b { font-size: 12px; }
+.runnerPreview { font-size: 12px; font-weight: 900; color: #334155; }
+@media (max-width: 980px) { .runnerSummaryGrid, .runnerActions { grid-template-columns: 1fr; } }
+
 .scanInput {
   position: fixed;
   left: -9999px;
@@ -685,6 +713,8 @@ button.big {
           <span id="persistenceWarn" class="persistWarn hidden">Event persistence failed — in-memory audit only.</span>
         </div>
       </div>
+
+      <div id="runnerActionPanel" class="runnerActionPanel hidden" role="dialog" aria-modal="false" aria-labelledby="runnerActionTitle"></div>
 
       <div id="grid" class="grid"></div>
     </section>
@@ -1328,7 +1358,7 @@ function addManualLap(studentId, rawElapsedMs, action, opts = {}) {
   btnUndo.disabled = session.lastActionStack.length === 0;
   rebuildSplitProjectionForStudent(studentId);
   pushFeedItem(`<b>Manual lap</b> — ${s.name} — ${fmtTime(adjustedElapsed)}`);
-  renderGrid(); saveSessionSnapshot(getCorrectionSnapshotStatus());
+  renderGrid(); if (selectedRunnerId === studentId) openRunnerActionPanel(studentId); saveSessionSnapshot(getCorrectionSnapshotStatus());
   return { ok: true, status: RFID_STATUSES.ACCEPTED, correctionEvent: finalEv, lap, adjustedElapsedMs: adjustedElapsed };
 }
 
@@ -1348,7 +1378,7 @@ function voidAcceptedLap(lapId, opts = {}) {
   lap.status = opts.quickUndo ? ACCEPTED_LAP_STATUSES.LEGACY_UNDONE : ACCEPTED_LAP_STATUSES.VOIDED;
   lap.voided = true; lap.correction_reason = reason; lap.undone_at_wall_time_iso = ev.created_wall_time_iso; lap.voided_at_wall_time_iso = ev.created_wall_time_iso;
   rebuildSplitProjectionForStudent(lap.student_id);
-  renderGrid(); saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
+  renderGrid(); if (selectedRunnerId === lap.student_id) openRunnerActionPanel(lap.student_id); saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
   return { ok: true, status: "VOIDED", correctionEvent: ev, lap };
 }
 
@@ -1709,6 +1739,8 @@ const elAuditTooSoon = document.getElementById("auditTooSoon");
 const elAuditUnknown = document.getElementById("auditUnknown");
 const elAuditMalformed = document.getElementById("auditMalformed");
 const elPersistenceWarn = document.getElementById("persistenceWarn");
+const elRunnerActionPanel = document.getElementById("runnerActionPanel");
+let selectedRunnerId = null;
 
 const btnStart = document.getElementById("btnStart");
 const btnStop = document.getElementById("btnStop");
@@ -1890,6 +1922,104 @@ function renderCounters() {
   c3.textContent = n3;
 }
 
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, ch => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
+}
+
+function getRunnerStatusLabel(studentId) {
+  const p = projectAcceptedLapsForStudent(studentId);
+  if (p.finished) return "FINISHED";
+  if (p.currentLapNumber > 0) return "IN_PROGRESS";
+  return "NOT_STARTED";
+}
+
+function getRunnerTimingSummary(studentId) {
+  const active = getActiveAcceptedLapsForStudent(studentId);
+  const latest = active[active.length - 1] || null;
+  const prev = active[active.length - 2] || null;
+  return {
+    completed: active.length,
+    required: getTargetPasses(),
+    status: getRunnerStatusLabel(studentId),
+    latestAdjustedMs: latest ? Number(latest.adjusted_elapsed_ms) : null,
+    latestLapMs: latest ? Number(latest.adjusted_elapsed_ms) - (prev ? Number(prev.adjusted_elapsed_ms) : 0) : null,
+    latestLap: latest,
+  };
+}
+
+function getMostRecentActiveLapForRunner(studentId) {
+  const active = getActiveAcceptedLapsForStudent(studentId);
+  return active[active.length - 1] || null;
+}
+
+function makeCorrectionOperationId(kind, studentId, extra = "") {
+  return `ui_${kind}_${studentId}_${Date.now()}_${Math.random().toString(36).slice(2)}_${extra}`;
+}
+
+function correctedAdjustedPreviewText(studentId, text) {
+  const p = parseCorrectedElapsedInput(text);
+  if (!p.ok) return p.error;
+  const offset = Number(getLockedRunnerSnapshot(studentId)?.start_offset_seconds || 0) * 1000;
+  const adjusted = p.valueMs - offset;
+  return adjusted < 0 ? `Before wave start by ${fmtTime(Math.abs(adjusted))}.` : `Adjusted preview: ${fmtTime(adjusted)} (subtracts ${fmtTime(offset)} start offset once).`;
+}
+
+function buildRunnerHistory(studentId) {
+  const rows = [];
+  for (const lap of (session.acceptedLaps || []).filter(l => l.student_id === studentId)) rows.push({ t: lap.event_wall_time_iso || "", html: `<b>Lap ${lap.status || "ACTIVE"}</b> ${escapeHtml(lap.source_event_type || lap.source || "")} raw ${formatCorrectedElapsedInput(lap.raw_elapsed_ms)} adjusted ${formatCorrectedElapsedInput(lap.adjusted_elapsed_ms)} scan# ${lap.scan_number || "—"}${lap.correction_reason ? ` reason: ${escapeHtml(lap.correction_reason)}` : ""}` });
+  for (const raw of (session.rawHardwareEvents || []).filter(e => e.student_id === studentId || String(e.normalized_tag_value || "") === String(getStudentIdentitySnapshot(studentId).tag_id || ""))) rows.push({ t: raw.captured_wall_time_iso || "", html: `<b>RFID ${escapeHtml(raw.processing_status || "")}</b> tag ${escapeHtml(raw.normalized_tag_value || raw.original_tag_value || "")} ${escapeHtml(raw.processing_reason || "")}` });
+  for (const ev of (session.correctionEvents || []).filter(e => e.student_id === studentId)) rows.push({ t: ev.created_wall_time_iso || "", html: `<b>Correction ${escapeHtml(ev.action || "")}</b> ${escapeHtml(ev.status || "APPLIED")} raw ${ev.requested_raw_elapsed_ms == null ? "—" : formatCorrectedElapsedInput(ev.requested_raw_elapsed_ms)} adjusted ${ev.applied_adjusted_elapsed_ms == null ? "—" : formatCorrectedElapsedInput(ev.applied_adjusted_elapsed_ms)}${ev.reason ? ` reason: ${escapeHtml(ev.reason)}` : ""}` });
+  return rows.sort((a,b) => String(b.t).localeCompare(String(a.t))).map(r => `<div class="runnerHistoryItem">${r.html}<br><span class="k">${escapeHtml(r.t || "no time")}</span></div>`).join("") || `<div class="runnerHistoryItem">No history for this runner.</div>`;
+}
+
+function setRunnerPanelMessage(text, ok) {
+  const msg = document.getElementById("runnerPanelMessage");
+  if (!msg) return;
+  msg.className = `runnerPanelMessage ${ok ? "ok" : "err"}`;
+  msg.textContent = text;
+}
+
+function closeRunnerActionPanel() {
+  selectedRunnerId = null;
+  if (elRunnerActionPanel) { elRunnerActionPanel.classList.add("hidden"); elRunnerActionPanel.innerHTML = ""; }
+  if (session.started) focusScanInput();
+}
+
+function openRunnerActionPanel(studentId) {
+  const s = getLockedRunnerSnapshot(studentId) || students.find(x => x.id === studentId);
+  if (!s || !elRunnerActionPanel) return;
+  selectedRunnerId = studentId;
+  const id = getStudentIdentitySnapshot(studentId);
+  const sum = getRunnerTimingSummary(studentId);
+  const latest = sum.latestLap;
+  const latestLapNumber = latest ? buildAcceptedScanProjectionRows(studentId).find(r => r.scan_number === latest.scan_number && r.status === ACCEPTED_LAP_STATUSES.ACTIVE)?.lap_number : null;
+  elRunnerActionPanel.innerHTML = `
+    <div class="runnerActionHeader"><div><div id="runnerActionTitle" class="runnerActionTitle">Runner ${escapeHtml(id.runner_no)} — ${escapeHtml(id.name || "Unnamed")}</div><div class="k">Tag ${escapeHtml(id.tag_id || "—")} • Class ${escapeHtml(id.runner_class || "—")}</div></div><button id="btnRunnerClose" class="secondary">Cancel/Close</button></div>
+    <div class="runnerSummaryGrid">
+      <div><span class="k">Start offset</span><br><b>${escapeHtml(id.start_offset_seconds)}s</b></div><div><span class="k">Laps</span><br><b>${sum.completed}/${sum.required}</b></div><div><span class="k">Status</span><br><b>${sum.status}</b></div><div><span class="k">Latest adjusted</span><br><b>${sum.latestAdjustedMs == null ? "—" : fmtTime(sum.latestAdjustedMs)}</b></div><div><span class="k">Latest lap</span><br><b>${sum.latestLapMs == null ? "—" : fmtTime(sum.latestLapMs)}</b></div>
+    </div>
+    <div id="runnerPanelMessage" class="runnerPanelMessage">Choose an action. Corrected time is raw elapsed time from the common teacher-controlled session start.</div>
+    <div class="runnerActions">
+      <div class="runnerActionBox"><b>Add lap: current time</b><label>Optional reason<textarea id="runnerCurrentReason" rows="2"></textarea></label><button id="btnRunnerAddCurrent" ${session.started ? "" : "disabled"}>Add current lap</button></div>
+      <div class="runnerActionBox"><b>Add lap: corrected time</b><div class="k">Enter seconds or MM:SS(.sss) raw session elapsed.</div><label>Raw elapsed<input id="runnerCorrectedTime" inputmode="decimal" placeholder="MM:SS.sss" /></label><div id="runnerAdjustedPreview" class="runnerPreview">Adjusted preview: —</div><label>Required reason<textarea id="runnerCorrectedReason" rows="2"></textarea></label><button id="btnRunnerAddCorrected">Add corrected lap</button></div>
+      <div class="runnerActionBox"><b>Void latest active lap</b><div id="runnerVoidTarget">${latest ? `Lap ${latestLapNumber || "—"}: ${escapeHtml(latest.source_event_type || latest.source || "")} raw ${formatCorrectedElapsedInput(latest.raw_elapsed_ms)} adjusted ${formatCorrectedElapsedInput(latest.adjusted_elapsed_ms)}` : "No active lap to void."}</div><label><input id="runnerVoidConfirm" type="checkbox" /> I confirm this selected runner lap should be voided.</label><label>Required reason<textarea id="runnerVoidReason" rows="2"></textarea></label><button id="btnRunnerVoid" ${latest ? "" : "disabled"}>Void latest lap</button></div>
+    </div>
+    <div><b>Runner history</b><div id="runnerHistory" class="runnerHistory">${buildRunnerHistory(studentId)}</div></div>`;
+  elRunnerActionPanel.classList.remove("hidden");
+  document.getElementById("btnRunnerClose").addEventListener("click", closeRunnerActionPanel);
+  const correctedInput = document.getElementById("runnerCorrectedTime");
+  correctedInput.addEventListener("input", () => { document.getElementById("runnerAdjustedPreview").textContent = correctedAdjustedPreviewText(studentId, correctedInput.value); });
+  const runOp = (button, fn) => { if (button.disabled) return; button.disabled = true; try { const r = fn(); openRunnerActionPanel(studentId); setRunnerPanelMessage(`${r.ok ? "Success" : "Rejected"}: ${r.status}${r.reason ? ` — ${r.reason}` : ""}`, !!r.ok); } finally { button.disabled = false; } };
+  document.getElementById("btnRunnerAddCurrent").addEventListener("click", e => runOp(e.currentTarget, () => manualAddCurrentLap(studentId, { operationId: makeCorrectionOperationId("current", studentId), reason: document.getElementById("runnerCurrentReason").value })));
+  document.getElementById("btnRunnerAddCorrected").addEventListener("click", e => runOp(e.currentTarget, () => manualAddCorrectedLapFromInput(studentId, document.getElementById("runnerCorrectedTime").value, { operationId: makeCorrectionOperationId("corrected", studentId, document.getElementById("runnerCorrectedTime").value), reason: document.getElementById("runnerCorrectedReason").value })));
+  document.getElementById("btnRunnerVoid").addEventListener("click", e => runOp(e.currentTarget, () => {
+    if (!document.getElementById("runnerVoidConfirm").checked) return { ok:false, status:"CONFIRMATION_REQUIRED", reason:"Confirm the specific latest lap before voiding." };
+    const lap = getMostRecentActiveLapForRunner(studentId);
+    return lap ? voidAcceptedLap(lap.lap_id, { operationId: makeCorrectionOperationId("void", studentId, lap.lap_id), reason: document.getElementById("runnerVoidReason").value }) : { ok:false, status:"NOT_FOUND", reason:"No active lap to void." };
+  }));
+  elRunnerActionPanel.querySelector("button, input, textarea").focus();
+}
+
 function renderGrid() {
   elGrid.innerHTML = "";
 
@@ -1921,6 +2051,11 @@ if (target === 4) {
 }
 
 tile.dataset.sid = s.id;
+tile.tabIndex = 0;
+if (tile.setAttribute) {
+  tile.setAttribute("role", "button");
+  tile.setAttribute("aria-label", `Open actions for runner ${s.runner_no || s.id}`);
+}
 
     const name = document.createElement("div");
     name.className = "name";
@@ -1957,7 +2092,8 @@ tile.dataset.sid = s.id;
     times.textContent = displayLines.length ? displayLines.join("\n") : "—";
 
     tile.append(name, meta, times);
-    tile.addEventListener("click", () => manualAddCurrentLap(s.id, { source: "TAP" }));
+    tile.addEventListener("click", () => openRunnerActionPanel(s.id));
+    tile.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openRunnerActionPanel(s.id); } });
     elGrid.appendChild(tile);
   }
 
@@ -2353,6 +2489,7 @@ document.addEventListener("click", (e) => {
   const t = e.target;
   if (
     t.closest(".modalCard") ||          // analytics modal: don't steal focus
+    t.closest(".runnerActionPanel") ||
     t.closest(".session-controls") ||   // preset dropdown area
     t.closest(".hint") ||               // roster upload area
     t.closest("button") ||
@@ -2369,6 +2506,7 @@ document.addEventListener("click", (e) => {
 });
 
 window.addEventListener("blur", () => elFocusWarn.classList.remove("hidden"));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && elRunnerActionPanel && !elRunnerActionPanel.classList.contains("hidden")) closeRunnerActionPanel(); });
 
 // ===== CSV roster handling =====
 csvFile.addEventListener("change", async (e) => {
