@@ -1135,6 +1135,64 @@ function updateElapsedDisplay() {
   return setCurrentText("elapsed", fmtTime(currentDisplayElapsedMs()));
 }
 
+let liveElapsedTickerGeneration = 0;
+let liveElapsedRafId = null;
+let liveElapsedTimeoutId = null;
+let liveElapsedLastPaintMs = -Infinity;
+
+function cancelLiveElapsedScheduledWork() {
+  if (liveElapsedRafId != null && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(liveElapsedRafId);
+  if (liveElapsedTimeoutId != null) window.clearTimeout(liveElapsedTimeoutId);
+  liveElapsedRafId = null;
+  liveElapsedTimeoutId = null;
+}
+
+function scheduleLiveElapsedFrame(generation) {
+  if (generation !== liveElapsedTickerGeneration || !session.started) return;
+  const onFrame = (frameTime) => {
+    liveElapsedRafId = null;
+    liveElapsedTimeoutId = null;
+    if (generation !== liveElapsedTickerGeneration || !session.started) return;
+    const nowMs = Number.isFinite(Number(frameTime)) ? Number(frameTime) : performance.now();
+    if ((nowMs - liveElapsedLastPaintMs) >= 100) {
+      updateElapsedDisplay();
+      liveElapsedLastPaintMs = nowMs;
+    }
+    scheduleLiveElapsedFrame(generation);
+  };
+  if (typeof window.requestAnimationFrame === "function") {
+    liveElapsedRafId = window.requestAnimationFrame(onFrame);
+  } else {
+    let timeoutReturned = false;
+    liveElapsedTimeoutId = window.setTimeout(() => {
+      if (!timeoutReturned) { liveElapsedTimeoutId = null; return; }
+      onFrame(performance.now());
+    }, 100);
+    timeoutReturned = true;
+  }
+}
+
+function stopLiveElapsedTicker() {
+  liveElapsedTickerGeneration += 1;
+  cancelLiveElapsedScheduledWork();
+  liveElapsedLastPaintMs = -Infinity;
+}
+
+function startLiveElapsedTicker() {
+  stopLiveElapsedTicker();
+  if (!session.started) { updateElapsedDisplay(); return; }
+  updateElapsedDisplay();
+  liveElapsedLastPaintMs = performance.now();
+  const generation = liveElapsedTickerGeneration;
+  scheduleLiveElapsedFrame(generation);
+}
+
+function handleElapsedPageReturn() {
+  if (!session.started) { updateElapsedDisplay(); return; }
+  updateElapsedDisplay();
+  startLiveElapsedTicker();
+}
+
 function fmtTime2(ms) {
   // MM:SS.xx (centiseconds)
   const totalCentis = Math.floor(ms / 10);
@@ -1779,6 +1837,7 @@ function calculateRecoveredElapsedMs(snapshot, elapsedMsAtSave) {
 }
 
 function applyRecoveredSessionSnapshot(snapshot) {
+  stopLiveElapsedTicker();
   if (!snapshot || !snapshot.session || !Array.isArray(snapshot.students) || !snapshot.sessionConfig) {
     throw new Error("Saved session recovery data is incomplete.");
   }
@@ -1833,11 +1892,9 @@ function applyRecoveredSessionSnapshot(snapshot) {
   btnUndo.disabled = session.lastActionStack.length === 0;
   updateElapsedDisplay();
 
-  if (session.timerHandle) window.clearInterval(session.timerHandle);
+  stopLiveElapsedTicker();
   session.timerHandle = null;
-  if (session.started) {
-    session.timerHandle = window.setInterval(updateElapsedDisplay, 100);
-  }
+  if (session.started) startLiveElapsedTicker();
 
   updateLiveCaptureLayout({ expandSetup: false });
   renderGrid();
@@ -2498,6 +2555,8 @@ function startRun() {
     return;
   }
 
+  stopLiveElapsedTicker();
+
   // Lock in sessionConfig at the moment Start is pressed
   sessionConfig = buildSessionConfigFromControls();
   session.lockedDebounceSeconds = sessionConfig.debounceSeconds;
@@ -2533,7 +2592,7 @@ function startRun() {
   renderGrid();
   renderAuditIndicator();
 
-  session.timerHandle = window.setInterval(updateElapsedDisplay, 100);
+  startLiveElapsedTicker();
 
   saveSessionSnapshot("ACTIVE");
   focusScanInput();
@@ -2550,7 +2609,7 @@ function endRun() {
 
   lockSessionControls(false);
 
-  if (session.timerHandle) window.clearInterval(session.timerHandle);
+  stopLiveElapsedTicker();
   session.timerHandle = null;
 
   updateLiveCaptureLayout({ expandSetup: false });
@@ -4163,6 +4222,9 @@ function drawSplitBars(canvas, splitsMs, avgMs, aimBridgeMs, aimStretchMs) {
     ctx.textBaseline = "alphabetic";
   }
 }
+
+window.addEventListener("pageshow", handleElapsedPageReturn);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) handleElapsedPageReturn(); });
 
 // ===== Buttons =====
 btnStart.addEventListener("click", startRun);
