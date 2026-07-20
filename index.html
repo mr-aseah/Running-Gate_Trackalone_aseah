@@ -750,6 +750,9 @@ button.big {
         <div class="hintRow small">
           V2 CSV headers: <code>runner_no,tag_id,name,class,start_offset_seconds,active</code>. Legacy <code>tagId,name</code> files are migrated automatically.
         </div>
+        <div class="hintRow small">
+          Transitional RFID tag formats: configured scanners use exactly four numeric characters (for example <code>0001</code>); field-test rosters may temporarily use exact 24-character hexadecimal full UIDs until the SM206 hardware is configured. Full UID support is transitional and may be removed after hardware configuration.
+        </div>
         <div id="rosterEditor" class="hintRow small" style="display:none; flex-direction:column; align-items:stretch; gap:6px;">
           <div><b>Roster editor</b>: edit CSV rows using <code>runner_no,tag_id,name,class,start_offset_seconds,active</code>.</div>
           <textarea id="rosterEditorText" rows="6" style="width:100%; font-family:monospace;"></textarea>
@@ -1060,8 +1063,20 @@ let session = {
 function rebuildTagLookup() {
   tagToRunnerId = new Map();
   for (const s of students) {
-    if (s && s.active !== false && s.tagId) tagToRunnerId.set(String(s.tagId), String(s.id));
+    if (s && s.active !== false && s.tagId) tagToRunnerId.set(normalizeTagForMatching(s.tagId), String(s.id));
   }
+}
+
+function normalizeTagForMatching(value) {
+  const text = String(value == null ? "" : value).trim();
+  if (/^\d{4}$/.test(text)) return text;
+  if (/^[0-9A-Fa-f]{24}$/.test(text)) return text.toUpperCase();
+  return text;
+}
+
+function isApprovedTagFormat(value) {
+  const text = String(value == null ? "" : value);
+  return /^\d{4}$/.test(text) || /^[0-9A-F]{24}$/.test(text);
 }
 
 function normalizeStudentRecord(s, fallbackIndex) {
@@ -1071,7 +1086,7 @@ function normalizeStudentRecord(s, fallbackIndex) {
     ...s,
     id,
     runner_no: id,
-    tagId: String((s && (s.tagId ?? s.tag_id)) ?? ""),
+    tagId: normalizeTagForMatching((s && (s.tagId ?? s.tag_id)) ?? ""),
     name: String((s && s.name) ?? ""),
     runner_class: String((s && (s.runner_class ?? s.class)) ?? ""),
     start_offset_seconds: Number.isFinite(Number(s && (s.start_offset_seconds ?? s.startOffsetSeconds))) ? Number(s.start_offset_seconds ?? s.startOffsetSeconds) : 0,
@@ -2512,7 +2527,7 @@ function createRawHardwareEvent(originalValue, capture) {
     captured_perf_ms: capturedPerfMs,
     elapsed_ms_from_session_start: session.started && Number.isFinite(session.startPerf) ? Math.max(0, capturedPerfMs - session.startPerf) : null,
     original_tag_value: String(originalValue),
-    normalized_tag_value: String(originalValue).trim(),
+    normalized_tag_value: normalizeTagForMatching(originalValue),
     student_id: null,
     processing_status: null,
     processing_reason: null,
@@ -2535,9 +2550,9 @@ function recordRfidKeyboardEvent(originalValue, capture) {
   const event = createRawHardwareEvent(originalValue, capture);
   const clean = event.normalized_tag_value;
 
-  if (!/^\d{4}$/.test(clean)) {
+  if (!isApprovedTagFormat(clean)) {
     pushFeedItem(`<b>Malformed RFID</b>: ${clean || "(empty)"}`);
-    finalizeRawHardwareEvent(event, RFID_STATUSES.MALFORMED, "RFID value was not exactly four numeric characters.", null, null);
+    finalizeRawHardwareEvent(event, RFID_STATUSES.MALFORMED, "RFID value was not exactly four numeric characters or exactly 24 hexadecimal characters.", null, null);
     return;
   }
 
@@ -2548,8 +2563,8 @@ function recordRfidKeyboardEvent(originalValue, capture) {
   }
 
   const runnerId = tagToRunnerId.get(clean);
-  const inactive = students.find(x => x.active === false && String(x.tagId) === clean);
-  const s = runnerId ? students.find(x => String(x.id) === runnerId) : (students.find(x => x.active !== false && String(x.tagId) === clean) || inactive);
+  const inactive = students.find(x => x.active === false && normalizeTagForMatching(x.tagId) === clean);
+  const s = runnerId ? students.find(x => String(x.id) === runnerId) : (students.find(x => x.active !== false && normalizeTagForMatching(x.tagId) === clean) || inactive);
   if (!s) {
     pushFeedItem(`<b>Unknown tag</b>: ${clean}`);
     finalizeRawHardwareEvent(event, RFID_STATUSES.UNKNOWN_TAG, "Tag was not found in the roster.", null, null);
@@ -2903,6 +2918,7 @@ if (btnDiscardSessionSnapshot) {
 function rosterTagNormalizeForImport(value) {
   const original = String(value == null ? "" : value).trim();
   if (/^\d{1,4}$/.test(original)) return original.padStart(4, "0");
+  if (/^[0-9A-Fa-f]{24}$/.test(original)) return original.toUpperCase();
   return original;
 }
 
@@ -2932,7 +2948,7 @@ function validateRosterRows(rows, options) {
     const tagOriginal = String(r.tag_id ?? r.tagId ?? "").trim();
     const tagId = rosterTagNormalizeForImport(tagOriginal);
     if (active === true && !tagId) errors.push(`Row ${rowNo}: tag_id is required for active runners.`);
-    if (tagId && !/^\d{4}$/.test(tagId)) errors.push(`Row ${rowNo}: tag_id "${tagOriginal}" is incompatible with the current four-digit SM206 profile.`);
+    if (tagId && !isApprovedTagFormat(tagId)) errors.push(`Row ${rowNo}: tag_id "${tagOriginal}" must be 1–4 digits or exactly 24 hexadecimal characters.`);
     if (tagId) {
       if (tags.has(tagId)) errors.push(`Row ${rowNo}: duplicate tag_id ${tagId} after normalisation.`);
       tags.add(tagId);
