@@ -554,7 +554,7 @@ button.big {
     <button id="btnStart">Start</button>
     <button id="btnStop" disabled>End Run</button>
     <button id="btnUndo" disabled>Undo</button>
-    <button id="btnExport" disabled>Export CSV</button>
+    <button id="btnExport" disabled>Export legacy CSV</button>
     <button id="btnAnalytics" class="secondary">Analytics</button>
   </div>
 
@@ -738,6 +738,15 @@ button.big {
   <div><span class="k">Debounce:</span> <span id="debounceDisplay">2</span>s</div>
   <div><span class="k">Notes:</span> <textarea id="sessionNotes" rows="2" style="width:95%;"></textarea></div>
   <div><span class="k">Roster loaded:</span> <span id="rosterCount">0</span></div>
+  <div class="sectionDivider"></div>
+  <div class="panelTitle">V2 data exports</div>
+  <div class="hint">Separate UTF-8 CSV snapshots. Spreadsheet apps may require importing <code>tag_id</code> as text; CSV preserves values such as <code>0001</code>.</div>
+  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;">
+    <button id="btnExportRawEvents" class="secondary small">Export raw RFID events</button>
+    <button id="btnExportAcceptedLaps" class="secondary small">Export accepted laps</button>
+    <button id="btnExportSessionSummary" class="secondary small">Export session summary</button>
+  </div>
+  <div id="v2ExportStatus" class="hint" aria-live="polite"></div>
 </div>
       </div>
     </aside>
@@ -1087,7 +1096,7 @@ function makeCsv(rows) {
     const s = String(v == null ? "" : v);
     return /[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
   };
-  return rows.map(r => r.map(esc).join(",")).join("\n");
+  return rows.map(r => r.map(esc).join(",")).join("\r\n");
 }
 
 function download(filename, text) {
@@ -1100,6 +1109,72 @@ function download(filename, text) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+
+function csvTextValue(v) { return v == null ? "" : String(v); }
+function csvNumberMs(v) { return Number.isFinite(Number(v)) ? String(Math.round(Number(v))) : ""; }
+function csvSeconds(v) { return Number.isFinite(Number(v)) ? (Number(v) / 1000).toFixed(3) : ""; }
+function csvSecondsValue(v) { return Number.isFinite(Number(v)) ? Number(v).toFixed(3) : ""; }
+function safeFilenamePart(v) { return String(v || "session").replace(/[^0-9A-Za-z._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "session"; }
+function exportTimestampForFilename(d = new Date()) { return d.toISOString().replace(/[:.]/g, "-"); }
+function getV2ExportBaseName(stamp) { return `${safeFilenamePart(session.sessionId || sessionConfig.sessionName || "session")}_${safeFilenamePart(sessionConfig.sessionName || sessionConfig.label || "run")}_${stamp}`; }
+function setV2ExportStatus(message, isError) {
+  const el = document.getElementById("v2ExportStatus");
+  if (el) { el.textContent = message; el.style.color = isError ? "#b91c1c" : "#166534"; }
+}
+function restoreExportFocus() { if (session.started) setTimeout(focusScanInput, 0); }
+
+const RAW_RFID_EXPORT_HEADERS = ["event_id","session_id","source","captured_wall_time_iso","captured_perf_ms","elapsed_ms_from_session_start","original_tag_value","normalized_tag_value","runner_no","student_id","processing_status","processing_reason","linked_lap_id","accepted_split_index"];
+const ACCEPTED_LAP_EXPORT_HEADERS = ["session_id","runner_no","tag_id","name","class","start_offset_seconds","scan_number","lap_number","raw_scan_time","elapsed_time_seconds","lap_time_seconds","status","source","voided","correction_reason"];
+const SESSION_SUMMARY_EXPORT_HEADERS = ["session_id","session_name","session_status","started_at_wall_time_iso","ended_at_wall_time_iso","ended_elapsed_seconds","preset","required_laps","lap_distance_metres","total_distance_metres","debounce_seconds","roster_count","active_runner_count","completed_runner_count","raw_event_count","accepted_active_lap_count","voided_or_undone_lap_count","correction_event_count","session_notes","exported_at_wall_time_iso"];
+
+function buildRawRfidEventsExportRows() {
+  const lapByRawEventId = new Map();
+  (session.acceptedLaps || []).forEach(lap => { if (lap && lap.source_event_id) lapByRawEventId.set(String(lap.source_event_id), lap); });
+  const rows = [RAW_RFID_EXPORT_HEADERS];
+  (session.rawHardwareEvents || []).slice().sort((a,b) => {
+    const ap = Number.isFinite(Number(a.captured_perf_ms)) ? Number(a.captured_perf_ms) : Number.MAX_SAFE_INTEGER;
+    const bp = Number.isFinite(Number(b.captured_perf_ms)) ? Number(b.captured_perf_ms) : Number.MAX_SAFE_INTEGER;
+    if (ap !== bp) return ap - bp;
+    return String(a.event_id || "").localeCompare(String(b.event_id || ""));
+  }).forEach(ev => {
+    const lap = lapByRawEventId.get(String(ev.event_id || ""));
+    const identity = ev.student_id ? getStudentIdentitySnapshot(ev.student_id) : null;
+    rows.push([ev.event_id, ev.session_id, ev.source, ev.captured_wall_time_iso, csvNumberMs(ev.captured_perf_ms), csvNumberMs(ev.elapsed_ms_from_session_start), ev.original_tag_value, ev.normalized_tag_value, (lap && lap.runner_no) || (identity && identity.runner_no) || "", ev.student_id, ev.processing_status, ev.processing_reason, lap ? lap.lap_id : "", ev.accepted_split_index]);
+  });
+  return rows;
+}
+function buildAcceptedLapsExportRows() {
+  const rows = [ACCEPTED_LAP_EXPORT_HEADERS];
+  buildAcceptedScanProjectionRows().slice().sort((a,b) => String(a.runner_no).localeCompare(String(b.runner_no), undefined, {numeric:true}) || ((Number(a.scan_number)||0)-(Number(b.scan_number)||0)) || String(a.lap_id||"").localeCompare(String(b.lap_id||""))).forEach(r => {
+    rows.push([r.session_id, r.runner_no, r.tag_id, r.name, r.class, csvSecondsValue(r.start_offset_seconds), r.scan_number, r.lap_number == null ? "" : r.lap_number, r.raw_scan_time, csvSecondsValue(r.elapsed_time_seconds), csvSecondsValue(r.lap_time_seconds), r.status, (r.source === "SCAN" ? "RFID" : r.source), r.voided === true ? "true" : "false", r.correction_reason]);
+  });
+  return rows;
+}
+function buildSessionSummaryExportRows(exportedAt = new Date().toISOString()) {
+  const activeStudents = getActiveStudents();
+  const activeLapRows = buildAcceptedScanProjectionRows().filter(r => r.status === ACCEPTED_LAP_STATUSES.ACTIVE && r.voided !== true);
+  const countsByRunner = new Map(); activeLapRows.forEach(r => countsByRunner.set(String(r.runner_no), (countsByRunner.get(String(r.runner_no)) || 0) + 1));
+  const required = getTargetPasses();
+  const completed = activeStudents.filter(s => (countsByRunner.get(String(s.runner_no || s.id)) || 0) >= required).length;
+  const rows = [SESSION_SUMMARY_EXPORT_HEADERS];
+  rows.push([session.sessionId, sessionConfig.sessionName, session.started ? "ACTIVE" : "COMPLETED", session.startWallTimeIso, session.started ? "" : session.endedWallTimeIso, session.started ? "" : csvSeconds(session.endedElapsedMs), sessionConfig.label, required, sessionConfig.repDistanceM, sessionConfig.totalDistanceM, Number.isFinite(Number(session.lockedDebounceSeconds)) ? Number(session.lockedDebounceSeconds).toString() : csvSecondsValue(sessionConfig.debounceSeconds), students.length, activeStudents.length, completed, (session.rawHardwareEvents || []).length, activeLapRows.length, (session.acceptedLaps || []).filter(l => l && (l.voided === true || l.status === ACCEPTED_LAP_STATUSES.VOIDED || l.status === ACCEPTED_LAP_STATUSES.LEGACY_UNDONE)).length, (session.correctionEvents || []).length, sessionConfig.notes, exportedAt]);
+  return rows;
+}
+function exportV2Csv(kind) {
+  const activeNote = session.started ? " Snapshot taken while capture is still active." : "";
+  try {
+    const stamp = exportTimestampForFilename();
+    const base = getV2ExportBaseName(stamp);
+    const map = { raw: ["raw_rfid_events", buildRawRfidEventsExportRows], accepted: ["accepted_laps", buildAcceptedLapsExportRows], summary: ["session_summary", () => buildSessionSummaryExportRows(new Date().toISOString())] };
+    const [suffix, builder] = map[kind];
+    const csv = makeCsv(builder());
+    download(`${base}_${suffix}.csv`, csv);
+    setV2ExportStatus(`Exported ${suffix.replaceAll("_", " ")}.${activeNote}`, false);
+  } catch (err) {
+    setV2ExportStatus(`Export failed: ${err && err.message ? err.message : err}`, true);
+  } finally { restoreExportFocus(); }
 }
 
 function makeSessionId() {
@@ -1521,6 +1596,7 @@ function buildAcceptedScanProjectionRows(studentId) {
       source: lap.source || "",
       voided: lap.voided === true,
       correction_reason: lap.correction_reason || null,
+      lap_id: lap.lap_id || "",
     };
   });
 }
@@ -3931,6 +4007,12 @@ btnStart.addEventListener("click", startRun);
 btnStop.addEventListener("click", endRun);
 btnUndo.addEventListener("click", undoLast);
 btnExport.addEventListener("click", exportCsv);
+const btnExportRawEvents = document.getElementById("btnExportRawEvents");
+const btnExportAcceptedLaps = document.getElementById("btnExportAcceptedLaps");
+const btnExportSessionSummary = document.getElementById("btnExportSessionSummary");
+if (btnExportRawEvents) btnExportRawEvents.addEventListener("click", () => exportV2Csv("raw"));
+if (btnExportAcceptedLaps) btnExportAcceptedLaps.addEventListener("click", () => exportV2Csv("accepted"));
+if (btnExportSessionSummary) btnExportSessionSummary.addEventListener("click", () => exportV2Csv("summary"));
 
 if (btnExportAnalytics) {
   btnExportAnalytics.addEventListener("click", function () {
