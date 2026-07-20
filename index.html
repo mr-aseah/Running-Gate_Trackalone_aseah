@@ -1139,12 +1139,19 @@ let liveElapsedTickerGeneration = 0;
 let liveElapsedRafId = null;
 let liveElapsedTimeoutId = null;
 let liveElapsedLastPaintMs = -Infinity;
+let liveElapsedBootstrapId = null;
+let liveElapsedStartupWatchdogId = null;
+let liveElapsedBootstrapGeneration = 0;
 
 function cancelLiveElapsedScheduledWork() {
   if (liveElapsedRafId != null && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(liveElapsedRafId);
   if (liveElapsedTimeoutId != null) window.clearTimeout(liveElapsedTimeoutId);
+  if (liveElapsedBootstrapId != null) window.clearTimeout(liveElapsedBootstrapId);
+  if (liveElapsedStartupWatchdogId != null) window.clearTimeout(liveElapsedStartupWatchdogId);
   liveElapsedRafId = null;
   liveElapsedTimeoutId = null;
+  liveElapsedBootstrapId = null;
+  liveElapsedStartupWatchdogId = null;
 }
 
 function scheduleLiveElapsedFrame(generation) {
@@ -1185,6 +1192,26 @@ function startLiveElapsedTicker() {
   liveElapsedLastPaintMs = performance.now();
   const generation = liveElapsedTickerGeneration;
   scheduleLiveElapsedFrame(generation);
+}
+
+function bootstrapLiveElapsedTickerAfterWorkflow() {
+  liveElapsedBootstrapGeneration += 1;
+  const generation = liveElapsedBootstrapGeneration;
+  if (liveElapsedBootstrapId != null) window.clearTimeout(liveElapsedBootstrapId);
+  if (liveElapsedStartupWatchdogId != null) window.clearTimeout(liveElapsedStartupWatchdogId);
+  liveElapsedBootstrapId = window.setTimeout(() => {
+    liveElapsedBootstrapId = null;
+    if (generation !== liveElapsedBootstrapGeneration || !session.started) return;
+    startLiveElapsedTicker();
+    liveElapsedStartupWatchdogId = window.setTimeout(() => {
+      liveElapsedStartupWatchdogId = null;
+      if (generation !== liveElapsedBootstrapGeneration || !session.started) return;
+      const elapsedEl = getCurrentDomElementById("elapsed");
+      if (currentDisplayElapsedMs() >= 250 && elapsedEl && elapsedEl.textContent === "00:00.0") {
+        startLiveElapsedTicker();
+      }
+    }, 350);
+  }, 0);
 }
 
 function handleElapsedPageReturn() {
@@ -1892,9 +1919,7 @@ function applyRecoveredSessionSnapshot(snapshot) {
   btnUndo.disabled = session.lastActionStack.length === 0;
   updateElapsedDisplay();
 
-  stopLiveElapsedTicker();
   session.timerHandle = null;
-  if (session.started) startLiveElapsedTicker();
 
   updateLiveCaptureLayout({ expandSetup: false });
   renderGrid();
@@ -1903,6 +1928,7 @@ function applyRecoveredSessionSnapshot(snapshot) {
   pushFeedItem(`<b>Recovered</b>: ${snapshot.status === "ACTIVE" ? "active" : "completed"} session ${sessionConfig.label}`);
   saveSessionSnapshot(snapshot.status === "ACTIVE" ? "ACTIVE" : "COMPLETED");
   focusScanInput();
+  if (session.started) bootstrapLiveElapsedTickerAfterWorkflow();
 }
 
 function maybeRecoverSavedSession() {
@@ -2592,10 +2618,9 @@ function startRun() {
   renderGrid();
   renderAuditIndicator();
 
-  startLiveElapsedTicker();
-
   saveSessionSnapshot("ACTIVE");
   focusScanInput();
+  bootstrapLiveElapsedTickerAfterWorkflow();
 }
 
 function endRun() {
@@ -4224,6 +4249,7 @@ function drawSplitBars(canvas, splitsMs, avgMs, aimBridgeMs, aimStretchMs) {
 }
 
 window.addEventListener("pageshow", handleElapsedPageReturn);
+window.addEventListener("focus", handleElapsedPageReturn);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) handleElapsedPageReturn(); });
 
 // ===== Buttons =====
