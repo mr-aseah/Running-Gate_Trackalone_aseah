@@ -1103,6 +1103,23 @@ function initSessionData() {
 }
 
 // ===== Utilities =====
+function getCurrentDomElementById(id) {
+  if (document.querySelectorAll) {
+    const safeId = String(id).replace(/\\/g, "\\\\").replace(/"/g, '\"');
+    const matches = Array.from(document.querySelectorAll(`[id="${safeId}"]`));
+    const connected = matches.find(el => el && el.isConnected !== false);
+    if (connected) return connected;
+    if (matches.length) return matches[0];
+  }
+  return document.getElementById ? document.getElementById(id) : null;
+}
+
+function setCurrentText(id, value) {
+  const el = getCurrentDomElementById(id);
+  if (el) el.textContent = String(value);
+  return el;
+}
+
 function nowElapsedMs() {
   if (!session.started) return 0;
   return Math.max(0, performance.now() - session.startPerf);
@@ -1115,7 +1132,7 @@ function currentDisplayElapsedMs() {
 }
 
 function updateElapsedDisplay() {
-  if (elElapsed) elElapsed.textContent = fmtTime(currentDisplayElapsedMs());
+  return setCurrentText("elapsed", fmtTime(currentDisplayElapsedMs()));
 }
 
 function fmtTime2(ms) {
@@ -2075,10 +2092,10 @@ function renderCounters() {
     else if (st === 2) n2++;
     else n3++;
   }
-  c0.textContent = n0;
-  c1.textContent = n1;
-  c2.textContent = n2;
-  c3.textContent = n3;
+  setCurrentText("c0", n0);
+  setCurrentText("c1", n1);
+  setCurrentText("c2", n2);
+  setCurrentText("c3", n3);
 }
 
 function escapeHtml(value) {
