@@ -188,13 +188,13 @@ body.setup-expanded .mode-controls, body.setup-expanded .session-controls { disp
 .layout { grid-template-columns: 1fr; padding-top: 6px; }
 .sidebar { display: none; }
 body.capture-compact #scanHint:not(.details-open) { padding: 6px 8px; }
-body.capture-compact #scanHint:not(.details-open) .rosterRow, body.capture-compact #scanHint:not(.details-open) .hintRow.small:not(.auditIndicator), body.capture-compact #scanHint:not(.details-open) #rosterEditor { display: none !important; }
+body.capture-compact #scanHint:not(.details-open) .rosterRow, body.capture-compact #scanHint:not(.details-open) .hintRow.small:not(.auditIndicator), body.capture-compact #scanHint:not(.details-open) #rosterEditor, body.capture-compact #scanHint:not(.details-open) .compactDetails { display: none !important; }
 .grid { margin-top: 12px; display: grid; gap: 10px; grid-template-columns: 1fr; }
-.captureDashboard { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 12px; align-items: start; }
+.captureDashboard { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 12px; align-items: start; }
 .runnerBlocks { display: grid; gap: 12px; min-width: 0; }
 .runnerBlock { scroll-margin-top: 96px; }
 .runnerBlockTitle { font-weight: 900; font-size: 13px; color: #334155; margin: 0 0 6px; }
-.runnerBlockColumns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.runnerBlockColumns { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .runnerColumn { display: grid; gap: 5px; align-content: start; }
 .runnerStrip { background: white; border: 2px solid #e5e7eb; border-left-width: 8px; border-radius: 10px; padding: 7px 8px; cursor: pointer; user-select: none; min-height: 42px; display: grid; grid-template-columns: 48px 54px 1fr 1fr auto; gap: 6px; align-items: center; font-size: 13px; font-variant-numeric: tabular-nums; }
 .runnerStrip:focus { outline: 3px solid #0ea5e9; outline-offset: 1px; }
@@ -220,6 +220,7 @@ body.capture-compact #scanHint:not(.details-open) .rosterRow, body.capture-compa
 .recentScanRow.newest { background: #ecfeff; }
 .recentScanMeta { color: #475569; font-weight: 700; }
 @media (max-width: 1050px) { .captureDashboard { grid-template-columns: 1fr; } .recentScansPanel { position: static; } }
+@media (max-width: 1200px) { .runnerBlockColumns { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 720px) { .runnerBlockColumns { grid-template-columns: 1fr; } .runnerStrip { grid-template-columns: 42px 48px 1fr; } .stripTotal, .stripStatus { grid-column: auto; } }
 
 /* ===== Analytics Modal ===== */
@@ -759,8 +760,6 @@ button.big {
           <span> • review <span id="auditReview">0</span></span>
           <span id="persistenceWarn" class="persistWarn hidden">Event persistence failed — in-memory audit only.</span>
         </div>
-      </div>
-
       <details id="dataTools" class="hint compactDetails">
         <summary><b>Data exports/tools</b></summary>
         <div class="hintRow small">Exports are available on demand so they do not consume live-capture space.</div>
@@ -779,6 +778,8 @@ button.big {
         <label class="hintRow small"><span class="k">Notes:</span><textarea id="sessionNotes" rows="2" style="width:95%;"></textarea></label>
         <div id="feed" class="feed"></div>
       </details>
+      </div>
+
 
       <div id="runnerActionPanel" class="runnerActionPanel hidden" role="dialog" aria-modal="false" aria-labelledby="runnerActionTitle"></div>
 
@@ -1105,6 +1106,16 @@ function initSessionData() {
 function nowElapsedMs() {
   if (!session.started) return 0;
   return Math.max(0, performance.now() - session.startPerf);
+}
+
+function currentDisplayElapsedMs() {
+  if (session.started) return nowElapsedMs();
+  if (Number.isFinite(Number(session.endedElapsedMs))) return Number(session.endedElapsedMs);
+  return 0;
+}
+
+function updateElapsedDisplay() {
+  if (elElapsed) elElapsed.textContent = fmtTime(currentDisplayElapsedMs());
 }
 
 function fmtTime2(ms) {
@@ -1803,14 +1814,12 @@ function applyRecoveredSessionSnapshot(snapshot) {
   btnStop.disabled = !session.started;
   btnExport.disabled = session.started;
   btnUndo.disabled = session.lastActionStack.length === 0;
-  elElapsed.textContent = fmtTime(restoredElapsedMs);
+  updateElapsedDisplay();
 
   if (session.timerHandle) window.clearInterval(session.timerHandle);
   session.timerHandle = null;
   if (session.started) {
-    session.timerHandle = window.setInterval(() => {
-      elElapsed.textContent = fmtTime(nowElapsedMs());
-    }, 100);
+    session.timerHandle = window.setInterval(updateElapsedDisplay, 100);
   }
 
   updateLiveCaptureLayout({ expandSetup: false });
@@ -2179,6 +2188,24 @@ function compareRunnerStable(a, b) {
 }
 
 function fmtTimeMs(ms) { return Number.isFinite(Number(ms)) ? formatCorrectedElapsedInput(Number(ms)) : "—"; }
+function fmtRunnerLapStrip(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return "—";
+  const seconds = Number(ms) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rem = seconds - minutes * 60;
+  return `${minutes}:${rem.toFixed(1).padStart(4, "0")}`;
+}
+function fmtRunnerTotalStrip(ms) {
+  if (ms == null || !Number.isFinite(Number(ms))) return "—";
+  const totalSeconds = Math.floor(Number(ms) / 1000);
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2,"0")}:${String(seconds).padStart(2,"0")}`;
+  return `${totalMinutes}:${String(seconds).padStart(2,"0")}`;
+}
 
 const RUNNER_STATUS_RULES = Object.freeze({
   NOT_STARTED: { key: "not-started", label: "Not started", mark: "○" },
@@ -2223,8 +2250,8 @@ function buildRunnerStrip(s) {
   const parts = [
     ["stripRunnerNo", `R${s.runner_no || s.id}`],
     ["stripLap", `L${Math.min(summary.completed, summary.required)}/${summary.required}`],
-    ["stripLatest", `Lap ${fmtTimeMs(summary.latestLapMs)}`],
-    ["stripTotal", `Total ${fmtTimeMs(summary.latestAdjustedMs)}`],
+    ["stripLatest", `Lap ${fmtRunnerLapStrip(summary.latestLapMs)}`],
+    ["stripTotal", `Total ${fmtRunnerTotalStrip(summary.latestAdjustedMs)}`],
     ["stripStatus", `${status.mark} ${status.label}`],
   ];
   parts.forEach(([cls, text]) => { const span = document.createElement("span"); span.className = cls; span.textContent = text; if (cls === "stripStatus" && span.setAttribute) span.setAttribute("aria-label", `Status: ${status.label}`); strip.appendChild(span); });
@@ -2287,10 +2314,13 @@ function renderGrid() {
     const block = document.createElement("section"); block.className = "runnerBlock"; block.id = `runner-block-${b+1}`;
     block.innerHTML = `<h3 class="runnerBlockTitle">Roster positions ${b*40+1}–${Math.min((b+1)*40, active.length)}</h3>`;
     const cols = document.createElement("div"); cols.className = "runnerBlockColumns";
-    const cLeft = document.createElement("div"), cMid = document.createElement("div"); cLeft.className = cMid.className = "runnerColumn";
-    active.slice(b*40, b*40+20).forEach(r => cLeft.appendChild(buildRunnerStrip(r)));
-    active.slice(b*40+20, b*40+40).forEach(r => cMid.appendChild(buildRunnerStrip(r)));
-    cols.append(cLeft, cMid); block.appendChild(cols); left.appendChild(block);
+    const blockRunners = active.slice(b*40, b*40+40);
+    const firstSize = Math.ceil(blockRunners.length / 3);
+    const remaining = Math.max(0, blockRunners.length - firstSize);
+    const secondSize = Math.ceil(remaining / 2);
+    const columnSlices = [blockRunners.slice(0, firstSize), blockRunners.slice(firstSize, firstSize + secondSize), blockRunners.slice(firstSize + secondSize)];
+    columnSlices.forEach(slice => { const col = document.createElement("div"); col.className = "runnerColumn"; slice.forEach(r => col.appendChild(buildRunnerStrip(r))); cols.appendChild(col); });
+    block.appendChild(cols); left.appendChild(block);
   }
   dashboard.appendChild(left); renderRecentScans(dashboard); elGrid.appendChild(dashboard);
   elRosterCount.textContent = `${active.length}/${students.length}`;
@@ -2476,6 +2506,7 @@ function startRun() {
   session.startWallTimeIso = new Date().toISOString();
   session.endedWallTimeIso = null;
   session.endedElapsedMs = null;
+  updateElapsedDisplay();
   session.acceptedLaps = [];
   session.acceptedLapCounter = 0;
   session.correctionEvents = [];
@@ -2494,9 +2525,7 @@ function startRun() {
   renderGrid();
   renderAuditIndicator();
 
-  session.timerHandle = window.setInterval(() => {
-    elElapsed.textContent = fmtTime(nowElapsedMs());
-  }, 100);
+  session.timerHandle = window.setInterval(updateElapsedDisplay, 100);
 
   saveSessionSnapshot("ACTIVE");
   focusScanInput();
@@ -2517,6 +2546,7 @@ function endRun() {
   session.timerHandle = null;
 
   updateLiveCaptureLayout({ expandSetup: false });
+  updateElapsedDisplay();
   pushFeedItem(`<b>Ended</b> — elapsed ${elElapsed.textContent}`);
   saveSessionSnapshot("COMPLETED");
 }
@@ -4575,6 +4605,7 @@ if (btnPrintClass) {
   renderGrid();
   renderCounters();
   renderAuditIndicator();
+  updateElapsedDisplay();
   updateLiveCaptureLayout({ expandSetup: true });
 maybeRecoverSavedSession();
   focusScanInput();
