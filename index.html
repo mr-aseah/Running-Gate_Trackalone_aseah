@@ -177,6 +177,18 @@ button.secondary { font-weight: 700; }
 
 
 /* ===== Stage 7 compact high-volume capture dashboard ===== */
+/* Legacy analytics is intentionally dormant in the capture-only V2 model; its code remains below for old exports/review but no capture toolbar opens it. */
+body.capture-compact .topbar { grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; padding: 6px 10px; align-items: center; }
+body.capture-compact .elapsed { font-size: 26px; }
+body.capture-compact .mode-controls, body.capture-compact .session-controls { display: none; }
+body.setup-expanded .mode-controls, body.setup-expanded .session-controls { display: flex; }
+.liveCompactSummary { font-size: 12px; font-weight: 800; color: #334155; }
+.compactDetails { margin-top: 8px; padding: 7px 9px; }
+.compactDetails:not([open]) { padding: 7px 9px; }
+.layout { grid-template-columns: 1fr; padding-top: 6px; }
+.sidebar { display: none; }
+body.capture-compact #scanHint:not(.details-open) { padding: 6px 8px; }
+body.capture-compact #scanHint:not(.details-open) .rosterRow, body.capture-compact #scanHint:not(.details-open) .hintRow.small:not(.auditIndicator), body.capture-compact #scanHint:not(.details-open) #rosterEditor { display: none !important; }
 .grid { margin-top: 12px; display: grid; gap: 10px; grid-template-columns: 1fr; }
 .captureDashboard { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 12px; align-items: start; }
 .runnerBlocks { display: grid; gap: 12px; min-width: 0; }
@@ -589,9 +601,9 @@ button.big {
     <button id="btnStart">Start</button>
     <button id="btnStop" disabled>End Run</button>
     <button id="btnUndo" disabled>Undo</button>
-    <button id="btnExport" disabled>Export legacy CSV</button>
-    <button id="btnAnalytics" class="secondary">Analytics</button>
+    <button id="btnSetupToggle" class="secondary" type="button">Setup/details</button>
   </div>
+  <div id="liveCompactSummary" class="liveCompactSummary" aria-live="polite">Setup ready</div>
 
   <!-- Mode + Class code (for Pair Mode sends) -->
   <div class="mode-controls">
@@ -749,42 +761,31 @@ button.big {
         </div>
       </div>
 
+      <details id="dataTools" class="hint compactDetails">
+        <summary><b>Data exports/tools</b></summary>
+        <div class="hintRow small">Exports are available on demand so they do not consume live-capture space.</div>
+        <div class="hintRow">
+          <button id="btnExport" class="secondary small" disabled>Export legacy CSV</button>
+          <button id="btnExportRawEvents" class="secondary small">Export raw RFID events</button>
+          <button id="btnExportAcceptedLaps" class="secondary small">Export accepted laps</button>
+          <button id="btnExportSessionSummary" class="secondary small">Export session summary</button>
+        </div>
+        <div id="v2ExportStatus" class="hint" aria-live="polite"></div>
+      </details>
+
+      <details id="legacyDiagnostics" class="hint compactDetails">
+        <summary><b>Diagnostics/details</b> — legacy activity log and notes</summary>
+        <div class="hintRow small">Legacy scan activity remains available for diagnostics, but the live dashboard shows only the Stage 7 Recent accepted scans column.</div>
+        <label class="hintRow small"><span class="k">Notes:</span><textarea id="sessionNotes" rows="2" style="width:95%;"></textarea></label>
+        <div id="feed" class="feed"></div>
+      </details>
+
       <div id="runnerActionPanel" class="runnerActionPanel hidden" role="dialog" aria-modal="false" aria-labelledby="runnerActionTitle"></div>
 
       <div id="grid" class="grid"></div>
     </section>
 
-    <aside id="sidebar" class="sidebar">
-      <div class="panel">
-        <div class="panelTitle">Last scans</div>
-        <div id="feed" class="feed"></div>
-      </div>
-
-      <div class="panel">
-        <div class="panelTitle">Session</div>
-<div class="panelBody">
-  <div><span class="k">Session:</span> <span id="sessionLabel">3 × 800m</span></div>
-  <div><span class="k">Reps:</span> <span id="sessionReps">3</span></div>
-  <div><span class="k">Rep distance:</span> <span id="sessionDist">800</span>m</div>
-  <div><span class="k">Total:</span> <span id="sessionTotal">2400</span>m</div>
-  <div><span class="k">Session name:</span> <span id="sessionNameDisplay">PE Run</span></div>
-  <div><span class="k">Session ID:</span> <span id="sessionIdDisplay">—</span></div>
-  <div><span class="k">Started:</span> <span id="sessionStartDisplay">Not started</span></div>
-  <div><span class="k">Debounce:</span> <span id="debounceDisplay">2</span>s</div>
-  <div><span class="k">Notes:</span> <textarea id="sessionNotes" rows="2" style="width:95%;"></textarea></div>
-  <div><span class="k">Roster loaded:</span> <span id="rosterCount">0</span></div>
-  <div class="sectionDivider"></div>
-  <div class="panelTitle">V2 data exports</div>
-  <div class="hint">Separate UTF-8 CSV snapshots. Spreadsheet apps may require importing <code>tag_id</code> as text; CSV preserves values such as <code>0001</code>.</div>
-  <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;">
-    <button id="btnExportRawEvents" class="secondary small">Export raw RFID events</button>
-    <button id="btnExportAcceptedLaps" class="secondary small">Export accepted laps</button>
-    <button id="btnExportSessionSummary" class="secondary small">Export session summary</button>
-  </div>
-  <div id="v2ExportStatus" class="hint" aria-live="polite"></div>
-</div>
-      </div>
-    </aside>
+    <aside id="sidebar" class="sidebar hidden" aria-hidden="true"></aside>
   </main>
 
 <!-- Analytics Modal -->
@@ -1812,6 +1813,7 @@ function applyRecoveredSessionSnapshot(snapshot) {
     }, 100);
   }
 
+  updateLiveCaptureLayout({ expandSetup: false });
   renderGrid();
   renderCounters();
   renderAuditIndicator();
@@ -1863,6 +1865,11 @@ const btnStart = document.getElementById("btnStart");
 const btnStop = document.getElementById("btnStop");
 const btnUndo = document.getElementById("btnUndo");
 const btnExport = document.getElementById("btnExport");
+const btnSetupToggle = document.getElementById("btnSetupToggle");
+const liveCompactSummary = document.getElementById("liveCompactSummary");
+const scanHint = document.getElementById("scanHint");
+const dataTools = document.getElementById("dataTools");
+const legacyDiagnostics = document.getElementById("legacyDiagnostics");
 
 // ===== Analytics UI =====
 const btnExportAnalytics = document.getElementById("btnExportAnalytics");
@@ -1979,6 +1986,32 @@ function paintSessionPanel(label, reps, dist) {
   if (sessionNameDisplayEl) sessionNameDisplayEl.textContent = sessionConfig.sessionName || (sessionNameInput ? sessionNameInput.value : "PE Run");
   if (sessionIdDisplayEl) sessionIdDisplayEl.textContent = session.sessionId || "—";
   if (sessionStartDisplayEl) sessionStartDisplayEl.textContent = session.startWallTimeIso || "Not started";
+}
+
+function getLockedSessionSummaryText() {
+  const activeCount = getActiveStudents().length;
+  const name = sessionConfig.sessionName || (sessionNameInput ? String(sessionNameInput.value || "PE Run") : "PE Run");
+  const reps = getTargetPasses();
+  const dist = Number(sessionConfig.repDistanceM || 0);
+  const total = Number(sessionConfig.totalDistanceM || (reps * dist));
+  const debounce = Number.isFinite(Number(session.lockedDebounceSeconds)) ? session.lockedDebounceSeconds : (sessionConfig.debounceSeconds || DEFAULT_DEBOUNCE_SECONDS);
+  return `${name} • ${reps} × ${dist}m • ${total}m • debounce ${debounce}s • ${activeCount} active`;
+}
+
+function setSetupExpanded(expanded) {
+  document.body.classList.toggle("setup-expanded", !!expanded);
+  if (scanHint) scanHint.classList.toggle("details-open", !!expanded);
+  if (btnSetupToggle) btnSetupToggle.textContent = expanded ? "Hide setup/details" : "Setup/details";
+  if (session.started) setTimeout(focusScanInput, 0);
+}
+
+function updateLiveCaptureLayout({ expandSetup } = {}) {
+  const compact = session.started || !!session.sessionId;
+  document.body.classList.toggle("capture-compact", compact);
+  if (liveCompactSummary) liveCompactSummary.textContent = compact ? getLockedSessionSummaryText() : "Full setup available before Start";
+  if (!compact) setSetupExpanded(true);
+  else setSetupExpanded(expandSetup === true ? true : false);
+  if (btnAnalytics) { btnAnalytics.hidden = true; btnAnalytics.style.display = "none"; }
 }
 
 function getTargetPasses() {
@@ -2200,6 +2233,12 @@ function buildRunnerStrip(s) {
   return strip;
 }
 
+function formatScanClockTime(iso) {
+  const d = new Date(String(iso || ""));
+  if (Number.isNaN(d.getTime())) return "no clock time";
+  return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}:${String(d.getSeconds()).padStart(2,"0")}.${String(d.getMilliseconds()).padStart(3,"0")}`;
+}
+
 function renderRecentScans(container) {
   const panel = document.createElement("aside");
   panel.className = "recentScansPanel";
@@ -2213,7 +2252,7 @@ function renderRecentScans(container) {
   rows.forEach((r, i) => {
     const btn = document.createElement("button");
     btn.type = "button"; btn.className = `recentScanRow ${i === 0 ? "newest" : ""}`; btn.dataset.sid = r.student_id;
-    const line = document.createElement("span"); line.textContent = r.event_wall_time_iso || "no clock time";
+    const line = document.createElement("span"); line.textContent = formatScanClockTime(r.event_wall_time_iso); if (line.setAttribute) line.setAttribute("title", r.event_wall_time_iso || "");
     const meta = document.createElement("span"); meta.className = "recentScanMeta"; meta.textContent = `R${r.runner_no} • ${r.tag_id || "—"} • L${r.lap_number}/${r.required_lap_count} • ${r.source === "SCAN" ? "RFID" : (r.source || "MANUAL")}`;
     btn.append(line, meta);
     btn.addEventListener("click", () => openRunnerActionPanel(r.student_id));
@@ -2451,6 +2490,7 @@ function startRun() {
   elFeed.innerHTML = "";
   paintSessionPanel(sessionConfig.label, sessionConfig.reps, sessionConfig.repDistanceM);
   pushFeedItem(`<b>Started</b> — ${sessionConfig.sessionName || "PE Run"} — ${sessionConfig.label} — ${session.startWallTimeIso}`);
+  updateLiveCaptureLayout({ expandSetup: false });
   renderGrid();
   renderAuditIndicator();
 
@@ -2476,6 +2516,7 @@ function endRun() {
   if (session.timerHandle) window.clearInterval(session.timerHandle);
   session.timerHandle = null;
 
+  updateLiveCaptureLayout({ expandSetup: false });
   pushFeedItem(`<b>Ended</b> — elapsed ${elElapsed.textContent}`);
   saveSessionSnapshot("COMPLETED");
 }
@@ -2911,6 +2952,7 @@ function editRoster(updatedRows) {
   setStudents(validated.students);
   for (const s of students) if (!session.dataById.has(s.id)) session.dataById.set(s.id, { splits: [], lastScanAtPerf: -Infinity });
   rebuildAllSplitProjections();
+  updateLiveCaptureLayout({ expandSetup: !session.started && !session.sessionId });
   renderGrid();
   saveRosterToStorage();
   renderRosterEditor();
@@ -4088,7 +4130,10 @@ function drawSplitBars(canvas, splitsMs, avgMs, aimBridgeMs, aimStretchMs) {
 btnStart.addEventListener("click", startRun);
 btnStop.addEventListener("click", endRun);
 btnUndo.addEventListener("click", undoLast);
-btnExport.addEventListener("click", exportCsv);
+if (btnSetupToggle) btnSetupToggle.addEventListener("click", () => { setSetupExpanded(!document.body.classList.contains("setup-expanded")); });
+if (dataTools) dataTools.addEventListener("toggle", () => { if (session.started) setTimeout(focusScanInput, 0); });
+if (legacyDiagnostics) legacyDiagnostics.addEventListener("toggle", () => { if (session.started) setTimeout(focusScanInput, 0); });
+if (btnExport) btnExport.addEventListener("click", exportCsv);
 const btnExportRawEvents = document.getElementById("btnExportRawEvents");
 const btnExportAcceptedLaps = document.getElementById("btnExportAcceptedLaps");
 const btnExportSessionSummary = document.getElementById("btnExportSessionSummary");
@@ -4299,7 +4344,8 @@ function closeAnalyticsModal() {
 }
 
 // Open button
-if (btnAnalytics) {
+// V2 capture-only model: legacy analytics remains in this file for compatibility, but the capture UI keeps it hidden/dormant.
+if (btnAnalytics && false) {
   btnAnalytics.addEventListener("click", function () {
     openAnalyticsModal();
   });
@@ -4529,7 +4575,8 @@ if (btnPrintClass) {
   renderGrid();
   renderCounters();
   renderAuditIndicator();
-  maybeRecoverSavedSession();
+  updateLiveCaptureLayout({ expandSetup: true });
+maybeRecoverSavedSession();
   focusScanInput();
 })();
 
