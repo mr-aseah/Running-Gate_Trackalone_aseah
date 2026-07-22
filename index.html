@@ -1475,6 +1475,7 @@ function nextScanNumberForStudent(studentId) {
 }
 
 function createAcceptedLapRecord(studentId, opts) {
+  const rawEventId = opts && (opts.rawEventId || opts.sourceEventId || opts.relatedRawEventId || null);
   const rawElapsed = Number.isFinite(opts && opts.rawElapsedMs) ? opts.rawElapsedMs : nowElapsedMs();
   const identity = getStudentIdentitySnapshot(studentId);
   const lap = {
@@ -1488,7 +1489,8 @@ function createAcceptedLapRecord(studentId, opts) {
     start_offset_seconds: identity.start_offset_seconds,
     scan_number: nextScanNumberForStudent(studentId),
     source_event_type: (opts && opts.sourceEventType) || ACCEPTED_LAP_SOURCE_TYPES.LEGACY,
-    source_event_id: (opts && Object.prototype.hasOwnProperty.call(opts, "sourceEventId")) ? opts.sourceEventId : null,
+    source_event_id: rawEventId,
+    raw_event_id: rawEventId,
     event_wall_time_iso: (opts && opts.eventWallTimeIso) || new Date().toISOString(),
     event_perf_ms: (opts && Number.isFinite(opts.eventPerfMs)) ? opts.eventPerfMs : performance.now(),
     raw_elapsed_ms: rawElapsed,
@@ -2181,9 +2183,16 @@ function studentStateIndex(sid) {
   return 1;
 }
 
+function getCounterRosterSnapshot() {
+  const locked = Array.isArray(session.lockedRosterSnapshot) ? session.lockedRosterSnapshot : [];
+  const hasSessionProjection = !!session.sessionId && session.dataById && session.dataById.size > 0;
+  const source = hasSessionProjection && locked.length ? locked : getActiveStudents();
+  return source.filter(s => s && s.active !== false);
+}
+
 function renderCounters() {
   let n0 = 0, n1 = 0, n2 = 0, n3 = 0;
-  for (const s of getActiveStudents()) {
+  for (const s of getCounterRosterSnapshot()) {
     const st = studentStateIndex(s.id);
     if (st === 0) n0++;
     else if (st === 1) n1++;
@@ -2513,7 +2522,7 @@ if ((perfNow - d.lastScanAtPerf) < debounceMs) {
   pushFeedItem(`<b>${label}</b> — ${s.name} — ${fmtTime(elapsed)} <span style="color:#555">(${srcLabel2})</span>`);
   renderGrid();
   saveSessionSnapshot("ACTIVE");
-  return { status: RFID_STATUSES.ACCEPTED, reason: "Accepted by existing split logic.", acceptedSplitIndex: beforeLen };
+  return { status: RFID_STATUSES.ACCEPTED, reason: "Accepted by existing split logic.", acceptedSplitIndex: beforeLen, acceptedLapId: lap.lap_id };
 }
 
 function createRawHardwareEvent(originalValue, capture) {
@@ -2523,24 +2532,42 @@ function createRawHardwareEvent(originalValue, capture) {
     event_id: makeRawHardwareEventId(capturedWallTimeIso),
     session_id: session.sessionId || null,
     source: RFID_SOURCE,
+    event_source: RFID_SOURCE,
     captured_wall_time_iso: capturedWallTimeIso,
+    received_at: capturedWallTimeIso,
     captured_perf_ms: capturedPerfMs,
+    received_perf_ms: capturedPerfMs,
     elapsed_ms_from_session_start: session.started && Number.isFinite(session.startPerf) ? Math.max(0, capturedPerfMs - session.startPerf) : null,
     original_tag_value: String(originalValue),
+    raw_value: String(originalValue),
     normalized_tag_value: normalizeTagForMatching(originalValue),
+    normalised_tag_id: normalizeTagForMatching(originalValue),
     student_id: null,
+    matched_student_id: null,
+    accepted: false,
     processing_status: null,
     processing_reason: null,
+    rejection_reason: null,
     accepted_split_index: null,
+    linked_lap_id: null,
   };
 }
 
-function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSplitIndex) {
+function appendRawHardwareEvent(event) {
+  if (!Array.isArray(session.rawHardwareEvents)) session.rawHardwareEvents = [];
+  if (!session.rawHardwareEvents.includes(event)) session.rawHardwareEvents.push(event);
+}
+
+function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSplitIndex, acceptedLapId) {
   event.student_id = studentId || null;
+  event.matched_student_id = studentId || null;
+  event.accepted = status === RFID_STATUSES.ACCEPTED;
   event.processing_status = status;
   event.processing_reason = reason || "";
+  event.rejection_reason = event.accepted ? null : (reason || "");
   event.accepted_split_index = Number.isInteger(acceptedSplitIndex) ? acceptedSplitIndex : null;
-  session.rawHardwareEvents.push(event);
+  event.linked_lap_id = acceptedLapId || null;
+  appendRawHardwareEvent(event);
   renderAuditIndicator();
   if (studentId) renderGrid();
   saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
@@ -2548,6 +2575,7 @@ function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSpli
 
 function recordRfidKeyboardEvent(originalValue, capture) {
   const event = createRawHardwareEvent(originalValue, capture);
+  appendRawHardwareEvent(event);
   const clean = event.normalized_tag_value;
 
   if (!isApprovedTagFormat(clean)) {
@@ -2572,7 +2600,7 @@ function recordRfidKeyboardEvent(originalValue, capture) {
   }
 
   const outcome = recordPassByStudentId(s.id, { source: "SCAN", rawTagId: clean, sourceEventId: event.event_id, eventWallTimeIso: event.captured_wall_time_iso, eventPerfMs: event.captured_perf_ms });
-  finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex);
+  finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex, outcome.acceptedLapId);
 }
 
 function recordPassByTagId(tagId) {
@@ -2654,6 +2682,7 @@ function endRun() {
 
   updateLiveCaptureLayout({ expandSetup: false });
   updateElapsedDisplay();
+  renderCounters();
   pushFeedItem(`<b>Ended</b> — elapsed ${elElapsed.textContent}`);
   saveSessionSnapshot("COMPLETED");
 }
