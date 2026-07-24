@@ -750,6 +750,9 @@ button.big {
         <div class="hintRow small">
           V2 CSV headers: <code>runner_no,tag_id,name,class,start_offset_seconds,active</code>. Legacy <code>tagId,name</code> files are migrated automatically.
         </div>
+        <div class="hintRow small">
+          Transitional RFID tag formats: configured scanners use exactly four numeric characters (for example <code>0001</code>); field-test rosters may temporarily use exact 24-character hexadecimal full UIDs until the SM206 hardware is configured. Full UID support is transitional and may be removed after hardware configuration.
+        </div>
         <div id="rosterEditor" class="hintRow small" style="display:none; flex-direction:column; align-items:stretch; gap:6px;">
           <div><b>Roster editor</b>: edit CSV rows using <code>runner_no,tag_id,name,class,start_offset_seconds,active</code>.</div>
           <textarea id="rosterEditorText" rows="6" style="width:100%; font-family:monospace;"></textarea>
@@ -1060,8 +1063,20 @@ let session = {
 function rebuildTagLookup() {
   tagToRunnerId = new Map();
   for (const s of students) {
-    if (s && s.active !== false && s.tagId) tagToRunnerId.set(String(s.tagId), String(s.id));
+    if (s && s.active !== false && s.tagId) tagToRunnerId.set(normalizeTagForMatching(s.tagId), String(s.id));
   }
+}
+
+function normalizeTagForMatching(value) {
+  const text = String(value == null ? "" : value).trim();
+  if (/^\d{4}$/.test(text)) return text;
+  if (/^[0-9A-Fa-f]{24}$/.test(text)) return text.toUpperCase();
+  return text;
+}
+
+function isApprovedTagFormat(value) {
+  const text = String(value == null ? "" : value);
+  return /^\d{4}$/.test(text) || /^[0-9A-F]{24}$/.test(text);
 }
 
 function normalizeStudentRecord(s, fallbackIndex) {
@@ -1071,7 +1086,7 @@ function normalizeStudentRecord(s, fallbackIndex) {
     ...s,
     id,
     runner_no: id,
-    tagId: String((s && (s.tagId ?? s.tag_id)) ?? ""),
+    tagId: normalizeTagForMatching((s && (s.tagId ?? s.tag_id)) ?? ""),
     name: String((s && s.name) ?? ""),
     runner_class: String((s && (s.runner_class ?? s.class)) ?? ""),
     start_offset_seconds: Number.isFinite(Number(s && (s.start_offset_seconds ?? s.startOffsetSeconds))) ? Number(s.start_offset_seconds ?? s.startOffsetSeconds) : 0,
@@ -1265,6 +1280,17 @@ function csvTextValue(v) { return v == null ? "" : String(v); }
 function csvNumberMs(v) { return Number.isFinite(Number(v)) ? String(Math.round(Number(v))) : ""; }
 function csvSeconds(v) { return Number.isFinite(Number(v)) ? (Number(v) / 1000).toFixed(3) : ""; }
 function csvSecondsValue(v) { return Number.isFinite(Number(v)) ? Number(v).toFixed(3) : ""; }
+function csvDurationDisplayFromSeconds(v) {
+  if (!Number.isFinite(Number(v)) || Number(v) < 0) return "";
+  const total = Number(v);
+  const minutes = Math.floor(total / 60);
+  const seconds = total - (minutes * 60);
+  const secondsText = seconds.toFixed(3).replace(/\.?0+$/, "");
+  return minutes > 0 ? `${minutes} min ${secondsText} sec` : `${secondsText} sec`;
+}
+function csvDurationDisplayFromMs(v) {
+  return Number.isFinite(Number(v)) ? csvDurationDisplayFromSeconds(Number(v) / 1000) : "";
+}
 function safeFilenamePart(v) { return String(v || "session").replace(/[^0-9A-Za-z._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "session"; }
 function exportTimestampForFilename(d = new Date()) { return d.toISOString().replace(/[:.]/g, "-"); }
 function getV2ExportBaseName(stamp) { return `${safeFilenamePart(session.sessionId || sessionConfig.sessionName || "session")}_${safeFilenamePart(sessionConfig.sessionName || sessionConfig.label || "run")}_${stamp}`; }
@@ -1274,13 +1300,39 @@ function setV2ExportStatus(message, isError) {
 }
 function restoreExportFocus() { if (session.started) setTimeout(focusScanInput, 0); }
 
-const RAW_RFID_EXPORT_HEADERS = ["event_id","session_id","source","captured_wall_time_iso","captured_perf_ms","elapsed_ms_from_session_start","original_tag_value","normalized_tag_value","runner_no","student_id","processing_status","processing_reason","linked_lap_id","accepted_split_index"];
-const ACCEPTED_LAP_EXPORT_HEADERS = ["session_id","runner_no","tag_id","name","class","start_offset_seconds","scan_number","lap_number","raw_scan_time","elapsed_time_seconds","lap_time_seconds","status","source","voided","correction_reason"];
-const SESSION_SUMMARY_EXPORT_HEADERS = ["session_id","session_name","session_status","started_at_wall_time_iso","ended_at_wall_time_iso","ended_elapsed_seconds","preset","required_laps","lap_distance_metres","total_distance_metres","debounce_seconds","roster_count","active_runner_count","completed_runner_count","raw_event_count","accepted_active_lap_count","voided_or_undone_lap_count","correction_event_count","session_notes","exported_at_wall_time_iso"];
+const RAW_RFID_EXPORT_HEADERS = ["event_id","session_id","source","captured_wall_time_iso","captured_perf_ms","elapsed_ms_from_session_start","original_tag_value","normalized_tag_value","runner_no","student_id","accepted","processing_status","processing_reason","linked_lap_id","accepted_split_index"];
+const ACCEPTED_LAP_EXPORT_HEADERS = ["lap_id","raw_event_id","session_id","runner_no","tag_id","name","class","start_offset_seconds","scan_number","lap_number","raw_scan_time","elapsed_time_seconds","elapsed_time_display","lap_time_seconds","lap_time_display","status","source","voided","correction_reason"];
+const SESSION_SUMMARY_EXPORT_HEADERS = ["session_id","session_name","session_status","started_at_wall_time_iso","ended_at_wall_time_iso","ended_elapsed_seconds","ended_elapsed_display","preset","required_laps","lap_distance_metres","total_distance_metres","debounce_seconds","roster_count","active_runner_count","completed_runner_count","raw_event_count","accepted_active_lap_count","voided_or_undone_lap_count","correction_event_count","session_notes","exported_at_wall_time_iso"];
+
+function acceptedRawEventIds() {
+  return new Set((session.acceptedLaps || [])
+    .map(lap => lap && (lap.raw_event_id || lap.source_event_id))
+    .filter(Boolean)
+    .map(String));
+}
+
+function rawEventOutcome(ev, lap, acceptedIds) {
+  const linkedLap = lap || null;
+  const linkedAccepted = !!(ev && acceptedIds && acceptedIds.has(String(ev.event_id || "")));
+  const accepted = !!(ev && (ev.accepted === true || ev.processing_status === RFID_STATUSES.ACCEPTED || linkedAccepted));
+  return {
+    accepted,
+    processingStatus: accepted ? RFID_STATUSES.ACCEPTED : (ev.processing_status || ""),
+    processingReason: ev.processing_reason || "",
+    linkedLapId: (ev.linked_lap_id || (linkedLap && linkedLap.lap_id) || ""),
+    acceptedSplitIndex: Number.isInteger(ev.accepted_split_index)
+      ? ev.accepted_split_index
+      : (linkedLap && Number.isFinite(Number(linkedLap.scan_number)) ? Number(linkedLap.scan_number) - 1 : ""),
+  };
+}
 
 function buildRawRfidEventsExportRows() {
   const lapByRawEventId = new Map();
-  (session.acceptedLaps || []).forEach(lap => { if (lap && lap.source_event_id) lapByRawEventId.set(String(lap.source_event_id), lap); });
+  (session.acceptedLaps || []).forEach(lap => {
+    const rawEventId = lap && (lap.raw_event_id || lap.source_event_id);
+    if (rawEventId) lapByRawEventId.set(String(rawEventId), lap);
+  });
+  const acceptedIds = acceptedRawEventIds();
   const rows = [RAW_RFID_EXPORT_HEADERS];
   (session.rawHardwareEvents || []).slice().sort((a,b) => {
     const ap = Number.isFinite(Number(a.captured_perf_ms)) ? Number(a.captured_perf_ms) : Number.MAX_SAFE_INTEGER;
@@ -1290,14 +1342,15 @@ function buildRawRfidEventsExportRows() {
   }).forEach(ev => {
     const lap = lapByRawEventId.get(String(ev.event_id || ""));
     const identity = ev.student_id ? getStudentIdentitySnapshot(ev.student_id) : null;
-    rows.push([ev.event_id, ev.session_id, ev.source, ev.captured_wall_time_iso, csvNumberMs(ev.captured_perf_ms), csvNumberMs(ev.elapsed_ms_from_session_start), ev.original_tag_value, ev.normalized_tag_value, (lap && lap.runner_no) || (identity && identity.runner_no) || "", ev.student_id, ev.processing_status, ev.processing_reason, lap ? lap.lap_id : "", ev.accepted_split_index]);
+    const outcome = rawEventOutcome(ev, lap, acceptedIds);
+    rows.push([ev.event_id, ev.session_id, ev.source, ev.captured_wall_time_iso, csvNumberMs(ev.captured_perf_ms), csvNumberMs(ev.elapsed_ms_from_session_start), ev.original_tag_value, ev.normalized_tag_value, (lap && lap.runner_no) || (identity && identity.runner_no) || "", ev.student_id, outcome.accepted ? "true" : "false", outcome.processingStatus, outcome.processingReason, outcome.linkedLapId, outcome.acceptedSplitIndex]);
   });
   return rows;
 }
 function buildAcceptedLapsExportRows() {
   const rows = [ACCEPTED_LAP_EXPORT_HEADERS];
   buildAcceptedScanProjectionRows().slice().sort((a,b) => String(a.runner_no).localeCompare(String(b.runner_no), undefined, {numeric:true}) || ((Number(a.scan_number)||0)-(Number(b.scan_number)||0)) || String(a.lap_id||"").localeCompare(String(b.lap_id||""))).forEach(r => {
-    rows.push([r.session_id, r.runner_no, r.tag_id, r.name, r.class, csvSecondsValue(r.start_offset_seconds), r.scan_number, r.lap_number == null ? "" : r.lap_number, r.raw_scan_time, csvSecondsValue(r.elapsed_time_seconds), csvSecondsValue(r.lap_time_seconds), r.status, (r.source === "SCAN" ? "RFID" : r.source), r.voided === true ? "true" : "false", r.correction_reason]);
+    rows.push([r.lap_id, r.raw_event_id, r.session_id, r.runner_no, r.tag_id, r.name, r.class, csvSecondsValue(r.start_offset_seconds), r.scan_number, r.lap_number == null ? "" : r.lap_number, r.raw_scan_time, csvSecondsValue(r.elapsed_time_seconds), csvDurationDisplayFromSeconds(r.elapsed_time_seconds), csvSecondsValue(r.lap_time_seconds), csvDurationDisplayFromSeconds(r.lap_time_seconds), r.status, (r.source === "SCAN" ? "RFID" : r.source), r.voided === true ? "true" : "false", r.correction_reason]);
   });
   return rows;
 }
@@ -1308,7 +1361,7 @@ function buildSessionSummaryExportRows(exportedAt = new Date().toISOString()) {
   const required = getTargetPasses();
   const completed = activeStudents.filter(s => (countsByRunner.get(String(s.runner_no || s.id)) || 0) >= required).length;
   const rows = [SESSION_SUMMARY_EXPORT_HEADERS];
-  rows.push([session.sessionId, sessionConfig.sessionName, session.started ? "ACTIVE" : "COMPLETED", session.startWallTimeIso, session.started ? "" : session.endedWallTimeIso, session.started ? "" : csvSeconds(session.endedElapsedMs), sessionConfig.label, required, sessionConfig.repDistanceM, sessionConfig.totalDistanceM, Number.isFinite(Number(session.lockedDebounceSeconds)) ? Number(session.lockedDebounceSeconds).toString() : csvSecondsValue(sessionConfig.debounceSeconds), students.length, activeStudents.length, completed, (session.rawHardwareEvents || []).length, activeLapRows.length, (session.acceptedLaps || []).filter(l => l && (l.voided === true || l.status === ACCEPTED_LAP_STATUSES.VOIDED || l.status === ACCEPTED_LAP_STATUSES.LEGACY_UNDONE)).length, (session.correctionEvents || []).length, sessionConfig.notes, exportedAt]);
+  rows.push([session.sessionId, sessionConfig.sessionName, session.started ? "ACTIVE" : "COMPLETED", session.startWallTimeIso, session.started ? "" : session.endedWallTimeIso, session.started ? "" : csvSeconds(session.endedElapsedMs), session.started ? "" : csvDurationDisplayFromMs(session.endedElapsedMs), sessionConfig.label, required, sessionConfig.repDistanceM, sessionConfig.totalDistanceM, Number.isFinite(Number(session.lockedDebounceSeconds)) ? Number(session.lockedDebounceSeconds).toString() : csvSecondsValue(sessionConfig.debounceSeconds), students.length, activeStudents.length, completed, (session.rawHardwareEvents || []).length, activeLapRows.length, (session.acceptedLaps || []).filter(l => l && (l.voided === true || l.status === ACCEPTED_LAP_STATUSES.VOIDED || l.status === ACCEPTED_LAP_STATUSES.LEGACY_UNDONE)).length, (session.correctionEvents || []).length, sessionConfig.notes, exportedAt]);
   return rows;
 }
 function exportV2Csv(kind) {
@@ -1460,6 +1513,7 @@ function nextScanNumberForStudent(studentId) {
 }
 
 function createAcceptedLapRecord(studentId, opts) {
+  const rawEventId = opts && (opts.rawEventId || opts.sourceEventId || opts.relatedRawEventId || null);
   const rawElapsed = Number.isFinite(opts && opts.rawElapsedMs) ? opts.rawElapsedMs : nowElapsedMs();
   const identity = getStudentIdentitySnapshot(studentId);
   const lap = {
@@ -1473,7 +1527,8 @@ function createAcceptedLapRecord(studentId, opts) {
     start_offset_seconds: identity.start_offset_seconds,
     scan_number: nextScanNumberForStudent(studentId),
     source_event_type: (opts && opts.sourceEventType) || ACCEPTED_LAP_SOURCE_TYPES.LEGACY,
-    source_event_id: (opts && Object.prototype.hasOwnProperty.call(opts, "sourceEventId")) ? opts.sourceEventId : null,
+    source_event_id: rawEventId,
+    raw_event_id: rawEventId,
     event_wall_time_iso: (opts && opts.eventWallTimeIso) || new Date().toISOString(),
     event_perf_ms: (opts && Number.isFinite(opts.eventPerfMs)) ? opts.eventPerfMs : performance.now(),
     raw_elapsed_ms: rawElapsed,
@@ -1613,7 +1668,9 @@ function setPersistenceWarning(show) {
 
 function renderAuditIndicator() {
   const events = Array.isArray(session.rawHardwareEvents) ? session.rawHardwareEvents : [];
-  const count = (status) => events.filter(e => e.processing_status === status).length;
+  const acceptedIds = acceptedRawEventIds();
+  const statusFor = (event) => rawEventOutcome(event, null, acceptedIds).processingStatus;
+  const count = (status) => events.filter(e => statusFor(e) === status).length;
   if (elAuditTotal) elAuditTotal.textContent = String(events.length);
   if (elAuditAccepted) elAuditAccepted.textContent = String(count(RFID_STATUSES.ACCEPTED));
   if (elAuditDebounced) elAuditDebounced.textContent = String(count(RFID_STATUSES.DEBOUNCED));
@@ -1752,6 +1809,7 @@ function buildAcceptedScanProjectionRows(studentId) {
       voided: lap.voided === true,
       correction_reason: lap.correction_reason || null,
       lap_id: lap.lap_id || "",
+      raw_event_id: lap.raw_event_id || lap.source_event_id || "",
     };
   });
 }
@@ -2166,9 +2224,16 @@ function studentStateIndex(sid) {
   return 1;
 }
 
+function getCounterRosterSnapshot() {
+  const locked = Array.isArray(session.lockedRosterSnapshot) ? session.lockedRosterSnapshot : [];
+  const hasSessionProjection = !!session.sessionId && session.dataById && session.dataById.size > 0;
+  const source = hasSessionProjection && locked.length ? locked : getActiveStudents();
+  return source.filter(s => s && s.active !== false);
+}
+
 function renderCounters() {
   let n0 = 0, n1 = 0, n2 = 0, n3 = 0;
-  for (const s of getActiveStudents()) {
+  for (const s of getCounterRosterSnapshot()) {
     const st = studentStateIndex(s.id);
     if (st === 0) n0++;
     else if (st === 1) n1++;
@@ -2498,7 +2563,7 @@ if ((perfNow - d.lastScanAtPerf) < debounceMs) {
   pushFeedItem(`<b>${label}</b> — ${s.name} — ${fmtTime(elapsed)} <span style="color:#555">(${srcLabel2})</span>`);
   renderGrid();
   saveSessionSnapshot("ACTIVE");
-  return { status: RFID_STATUSES.ACCEPTED, reason: "Accepted by existing split logic.", acceptedSplitIndex: beforeLen };
+  return { status: RFID_STATUSES.ACCEPTED, reason: "Accepted by existing split logic.", acceptedSplitIndex: beforeLen, acceptedLapId: lap.lap_id };
 }
 
 function createRawHardwareEvent(originalValue, capture) {
@@ -2508,24 +2573,42 @@ function createRawHardwareEvent(originalValue, capture) {
     event_id: makeRawHardwareEventId(capturedWallTimeIso),
     session_id: session.sessionId || null,
     source: RFID_SOURCE,
+    event_source: RFID_SOURCE,
     captured_wall_time_iso: capturedWallTimeIso,
+    received_at: capturedWallTimeIso,
     captured_perf_ms: capturedPerfMs,
+    received_perf_ms: capturedPerfMs,
     elapsed_ms_from_session_start: session.started && Number.isFinite(session.startPerf) ? Math.max(0, capturedPerfMs - session.startPerf) : null,
     original_tag_value: String(originalValue),
-    normalized_tag_value: String(originalValue).trim(),
+    raw_value: String(originalValue),
+    normalized_tag_value: normalizeTagForMatching(originalValue),
+    normalised_tag_id: normalizeTagForMatching(originalValue),
     student_id: null,
+    matched_student_id: null,
+    accepted: false,
     processing_status: null,
     processing_reason: null,
+    rejection_reason: null,
     accepted_split_index: null,
+    linked_lap_id: null,
   };
 }
 
-function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSplitIndex) {
+function appendRawHardwareEvent(event) {
+  if (!Array.isArray(session.rawHardwareEvents)) session.rawHardwareEvents = [];
+  if (!session.rawHardwareEvents.includes(event)) session.rawHardwareEvents.push(event);
+}
+
+function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSplitIndex, acceptedLapId) {
   event.student_id = studentId || null;
+  event.matched_student_id = studentId || null;
+  event.accepted = status === RFID_STATUSES.ACCEPTED;
   event.processing_status = status;
   event.processing_reason = reason || "";
+  event.rejection_reason = event.accepted ? null : (reason || "");
   event.accepted_split_index = Number.isInteger(acceptedSplitIndex) ? acceptedSplitIndex : null;
-  session.rawHardwareEvents.push(event);
+  event.linked_lap_id = acceptedLapId || null;
+  appendRawHardwareEvent(event);
   renderAuditIndicator();
   if (studentId) renderGrid();
   saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
@@ -2533,11 +2616,12 @@ function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSpli
 
 function recordRfidKeyboardEvent(originalValue, capture) {
   const event = createRawHardwareEvent(originalValue, capture);
+  appendRawHardwareEvent(event);
   const clean = event.normalized_tag_value;
 
-  if (!/^\d{4}$/.test(clean)) {
+  if (!isApprovedTagFormat(clean)) {
     pushFeedItem(`<b>Malformed RFID</b>: ${clean || "(empty)"}`);
-    finalizeRawHardwareEvent(event, RFID_STATUSES.MALFORMED, "RFID value was not exactly four numeric characters.", null, null);
+    finalizeRawHardwareEvent(event, RFID_STATUSES.MALFORMED, "RFID value was not exactly four numeric characters or exactly 24 hexadecimal characters.", null, null);
     return;
   }
 
@@ -2548,8 +2632,8 @@ function recordRfidKeyboardEvent(originalValue, capture) {
   }
 
   const runnerId = tagToRunnerId.get(clean);
-  const inactive = students.find(x => x.active === false && String(x.tagId) === clean);
-  const s = runnerId ? students.find(x => String(x.id) === runnerId) : (students.find(x => x.active !== false && String(x.tagId) === clean) || inactive);
+  const inactive = students.find(x => x.active === false && normalizeTagForMatching(x.tagId) === clean);
+  const s = runnerId ? students.find(x => String(x.id) === runnerId) : (students.find(x => x.active !== false && normalizeTagForMatching(x.tagId) === clean) || inactive);
   if (!s) {
     pushFeedItem(`<b>Unknown tag</b>: ${clean}`);
     finalizeRawHardwareEvent(event, RFID_STATUSES.UNKNOWN_TAG, "Tag was not found in the roster.", null, null);
@@ -2557,7 +2641,7 @@ function recordRfidKeyboardEvent(originalValue, capture) {
   }
 
   const outcome = recordPassByStudentId(s.id, { source: "SCAN", rawTagId: clean, sourceEventId: event.event_id, eventWallTimeIso: event.captured_wall_time_iso, eventPerfMs: event.captured_perf_ms });
-  finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex);
+  finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex, outcome.acceptedLapId);
 }
 
 function recordPassByTagId(tagId) {
@@ -2639,6 +2723,7 @@ function endRun() {
 
   updateLiveCaptureLayout({ expandSetup: false });
   updateElapsedDisplay();
+  renderCounters();
   pushFeedItem(`<b>Ended</b> — elapsed ${elElapsed.textContent}`);
   saveSessionSnapshot("COMPLETED");
 }
@@ -2681,7 +2766,8 @@ function exportCsv() {
   for (let i = 1; i <= n; i++) header.push(`split${i}_ms`);
   header.push("total_ms");
 
-  // Formatted columns (MM:SS.xx)
+  // Teacher-readable duration columns. Text words prevent spreadsheet apps
+  // from changing a running duration such as 04:37 into 12:04:37 AM.
   for (let i = 1; i <= n; i++) header.push(`t${i}`);
   for (let i = 1; i <= n; i++) header.push(`split${i}`);
   header.push("total");
@@ -2701,7 +2787,7 @@ function exportCsv() {
     for (let i = 0; i < n; i++) {
       const ti = (t[i] != null) ? t[i] : "";
       tMs.push(ti);
-      tFmt.push(ti === "" ? "" : fmtTime2(ti));
+      tFmt.push(ti === "" ? "" : csvDurationDisplayFromMs(ti));
     }
 
     for (let i = 0; i < n; i++) {
@@ -2716,12 +2802,12 @@ function exportCsv() {
         si = "";
       }
       splitMs.push(si);
-      splitFmt.push(si === "" ? "" : fmtTime2(si));
+      splitFmt.push(si === "" ? "" : csvDurationDisplayFromMs(si));
     }
 
     const finished = t.length >= n;
     const totalMs = finished ? t[n - 1] : "";
-    const totalFmt = totalMs === "" ? "" : fmtTime2(totalMs);
+    const totalFmt = totalMs === "" ? "" : csvDurationDisplayFromMs(totalMs);
     const status = finished ? "FINISHED" : "INCOMPLETE";
 
     rows.push([
@@ -2903,6 +2989,7 @@ if (btnDiscardSessionSnapshot) {
 function rosterTagNormalizeForImport(value) {
   const original = String(value == null ? "" : value).trim();
   if (/^\d{1,4}$/.test(original)) return original.padStart(4, "0");
+  if (/^[0-9A-Fa-f]{24}$/.test(original)) return original.toUpperCase();
   return original;
 }
 
@@ -2932,7 +3019,7 @@ function validateRosterRows(rows, options) {
     const tagOriginal = String(r.tag_id ?? r.tagId ?? "").trim();
     const tagId = rosterTagNormalizeForImport(tagOriginal);
     if (active === true && !tagId) errors.push(`Row ${rowNo}: tag_id is required for active runners.`);
-    if (tagId && !/^\d{4}$/.test(tagId)) errors.push(`Row ${rowNo}: tag_id "${tagOriginal}" is incompatible with the current four-digit SM206 profile.`);
+    if (tagId && !isApprovedTagFormat(tagId)) errors.push(`Row ${rowNo}: tag_id "${tagOriginal}" must be 1–4 digits or exactly 24 hexadecimal characters.`);
     if (tagId) {
       if (tags.has(tagId)) errors.push(`Row ${rowNo}: duplicate tag_id ${tagId} after normalisation.`);
       tags.add(tagId);
