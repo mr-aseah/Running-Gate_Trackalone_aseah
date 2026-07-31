@@ -2370,10 +2370,12 @@ const RECOVERABLE_RUNNER_REJECTIONS = new Set([RFID_STATUSES.DEBOUNCED, RFID_STA
 const STRONG_RUNNER_REJECTIONS = new Set([RFID_STATUSES.ALREADY_FINISHED, RFID_STATUSES.INACTIVE_RUNNER]);
 
 function eventTimeValue(ev) {
-  const p = Number(ev && (ev.captured_perf_ms ?? ev.event_perf_ms ?? ev.created_perf_ms));
-  if (Number.isFinite(p)) return p;
+  // Wall-clock timestamps remain comparable after recovery in a new page, while
+  // performance.now() restarts from a new origin.
   const t = Date.parse(String(ev && (ev.captured_wall_time_iso || ev.event_wall_time_iso || ev.created_wall_time_iso) || ""));
-  return Number.isFinite(t) ? t : 0;
+  if (Number.isFinite(t)) return t;
+  const p = Number(ev && (ev.captured_perf_ms ?? ev.event_perf_ms ?? ev.created_perf_ms));
+  return Number.isFinite(p) ? p : 0;
 }
 
 function getRunnerDashboardStatus(studentId) {
@@ -2446,7 +2448,7 @@ function buildRunnerOverview(active) {
 }
 function buildLiveGate() {
   const panel=document.createElement("section"); panel.className="liveGatePanel";
-  const completed=completedRunnerRows(), outstanding=completed.filter(r=>!session.doneAcknowledgements[String(r.student_id)]);
+  const completed=completedRunnerRows(), outstanding=completed.filter(r=>{const ack=session.doneAcknowledgements[String(r.student_id)];return !ack||String(ack.lapId||"")!==String(r.lap_id||"")});
   const title=document.createElement("div");title.className="gateTitle";title.innerHTML=`<span>DONE — DIRECT OUT</span><span>${outstanding.length} awaiting</span>`; if(Object.keys(session.doneAcknowledgements||{}).length){const restore=document.createElement("button");restore.type="button";restore.className="restoreAck";restore.textContent="Restore last acknowledged";restore.addEventListener("click",restoreLastAcknowledged);title.appendChild(restore)} panel.appendChild(title);
   const queue=document.createElement("div");queue.id="doneQueue";queue.className="doneQueue";
   if(!outstanding.length){const e=document.createElement("div");e.className="doneEmpty";e.textContent="No finish alerts awaiting direction.";queue.appendChild(e)}
@@ -2457,7 +2459,7 @@ function buildLiveGate() {
 }
 function buildChronologicalEvents() {
   const panel=document.createElement("aside");panel.className="chronologicalPanel";const title=document.createElement("div");title.className="gateTitle";const reviews=(session.rawHardwareEvents||[]).filter(e=>e.processing_status&&e.processing_status!==RFID_STATUSES.ACCEPTED).length;title.innerHTML=`<span>CHRONOLOGICAL EVENTS</span><span>${reviews} review</span>`;panel.appendChild(title);
-  const list=document.createElement("div");list.id="chronologicalEvents";list.className="eventList";const lapByRaw=new Map(activeLapRowsNewest().map(r=>[String(r.raw_event_id||""),r]));const events=(session.rawHardwareEvents||[]).slice().sort((a,b)=>(Number(b.captured_perf_ms)||0)-(Number(a.captured_perf_ms)||0)||String(b.event_id).localeCompare(String(a.event_id))).slice(0,15);
+  const list=document.createElement("div");list.id="chronologicalEvents";list.className="eventList";const lapByRaw=new Map(activeLapRowsNewest().map(r=>[String(r.raw_event_id||""),r]));const events=(session.rawHardwareEvents||[]).slice().sort((a,b)=>eventTimeValue(b)-eventTimeValue(a)||String(b.event_id).localeCompare(String(a.event_id)));
   if(!events.length){const e=document.createElement("div");e.className="doneEmpty";e.textContent="Every RFID outcome will appear here.";list.appendChild(e)}
   events.forEach(ev=>{const lap=lapByRaw.get(String(ev.event_id||""));const student=students.find(s=>String(s.id)===String(ev.student_id));const status=ev.processing_status||"CAPTURED";const done=lap&&Number(lap.lap_number)>=Number(lap.required_lap_count);const review=status!==RFID_STATUSES.ACCEPTED;const row=document.createElement("div");row.className=`eventRow ${done?"done":(review?(status===RFID_STATUSES.UNKNOWN_TAG||status===RFID_STATUSES.MALFORMED?"error":"review"):"accepted")}`;const time=document.createElement("div");time.className="eventTime";time.textContent=formatGateElapsed(ev.elapsed_ms_from_session_start);const body=document.createElement("div");const main=document.createElement("div");main.className="eventMain";const ident=student?`R${student.runner_no}`:(ev.normalized_tag_value||ev.original_tag_value||"NO TAG");let label=status;if(lap)label=`${done?"DONE":"LAP"} ${lap.lap_number}/${lap.required_lap_count} — ✓ ACCEPTED`;else if(status===RFID_STATUSES.ALREADY_FINISHED)label="EXTRA SCAN AFTER DONE — REVIEW";else if(status===RFID_STATUSES.DEBOUNCED)label="DUPLICATE — REVIEW";main.textContent=`${ident} • ${label}`;const reason=document.createElement("div");reason.className="eventReason";reason.textContent=ev.processing_reason||"Captured for audit.";body.append(main,reason);row.append(time,body);list.appendChild(row)});panel.appendChild(list);return panel;
 }
@@ -2592,7 +2594,9 @@ function finalizeRawHardwareEvent(event, status, reason, studentId, acceptedSpli
   event.linked_lap_id = acceptedLapId || null;
   appendRawHardwareEvent(event);
   renderAuditIndicator();
-  if (studentId) renderGrid();
+  // During capture, unmatched outcomes must refresh the chronological audit
+  // immediately as well as matched runner outcomes.
+  if (session.started || studentId) renderGrid();
   saveSessionSnapshot(session.started ? "ACTIVE" : "COMPLETED");
 }
 
