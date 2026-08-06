@@ -2662,6 +2662,13 @@ function recordRfidKeyboardEvent(originalValue, capture) {
   finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex, outcome.acceptedLapId);
 }
 
+function recordIncompleteRfidKeyboardEvent(originalValue, capture, interruptionReason) {
+  const event = createRawHardwareEvent(originalValue, capture);
+  appendRawHardwareEvent(event);
+  const reason = `RFID input was incomplete because it ${interruptionReason}; no terminating Enter was received.`;
+  finalizeRawHardwareEvent(event, RFID_STATUSES.MALFORMED, reason, null, null, null);
+}
+
 function recordPassByTagId(tagId) {
   const capture = { wallTimeIso: new Date().toISOString(), perfMs: performance.now() };
   recordRfidKeyboardEvent(String(tagId), capture);
@@ -2890,7 +2897,7 @@ function auditAndClearScannerPartial(reason) {
   if (!partial) return false;
   scannerTimedOutSinceLastEnter = true;
   pushFeedItem(`<b>Scanner warning</b>: partial RFID input ${escapeHtml(reason)}.`);
-  recordRfidKeyboardEvent(partial, { wallTimeIso: new Date().toISOString(), perfMs: performance.now() });
+  recordIncompleteRfidKeyboardEvent(partial, { wallTimeIso: new Date().toISOString(), perfMs: performance.now() }, reason);
   return true;
 }
 
