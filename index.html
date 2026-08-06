@@ -197,8 +197,13 @@ body.capture-compact #scanHint:not(.details-open) .rosterRow, body.capture-compa
 .overviewHeader { position:sticky; top:0; z-index:2; background:#fff; display:flex; justify-content:space-between; align-items:center; gap:8px; padding-bottom:8px; }
 .overviewTotals { font-size:12px; font-weight:800; color:#475569; }
 .liveGatePanel,.chronologicalPanel { min-width:0; overflow:hidden; background:#fff; border:2px solid #cbd5e1; border-radius:14px; padding:10px; display:grid; gap:9px; }
-.liveGatePanel { grid-template-rows:auto minmax(120px,.38fr) auto minmax(0,1fr); }.chronologicalPanel { grid-template-rows:auto minmax(0,1fr); }
+.liveGatePanel { grid-template-rows:minmax(52px,auto) auto minmax(100px,.38fr) auto minmax(0,1fr); }.chronologicalPanel { grid-template-rows:auto minmax(0,1fr); }
 .gateTitle { display:flex; justify-content:space-between; align-items:center; gap:8px; font-weight:1000; font-size:18px; }
+.scannerReadiness { min-height:0; box-sizing:border-box; display:flex; align-items:center; gap:10px; padding:6px 12px; border:3px solid; border-radius:12px; font-size:15px; line-height:1.15; }
+.scannerReadiness.armed { border-color:#15803d; background:#f0fdf4; color:#14532d; }
+.scannerReadiness.lost { border-color:#b91c1c; background:#fef2f2; color:#7f1d1d; }
+.scannerReadiness .readinessIcon { font-size:25px; flex:none; }
+.scannerReadiness small { display:block; margin-top:3px; font-size:11px; font-weight:700; color:#475569; }
 .doneQueue { overflow:auto; display:grid; gap:6px; align-content:start; border:2px solid #0f766e; border-radius:12px; padding:7px; background:#f0fdfa; }
 .doneEmpty { color:#475569; font-size:13px; padding:8px; }
 .doneRow { min-height:58px; display:grid; grid-template-columns:1fr auto 54px; align-items:center; gap:10px; padding:4px 8px; border-radius:10px; background:#ccfbf1; font-weight:1000; }
@@ -643,8 +648,8 @@ button.big {
 </div>
   </header>
 
-  <!-- Hidden scan capture: keep focus here -->
-  <input id="scanInput" class="scanInput" autocomplete="off" inputmode="none" />
+  <!-- Compatibility focus target only; page-level key capture is authoritative. -->
+  <input id="scanInput" class="scanInput" autocomplete="off" inputmode="none" readonly tabindex="-1" aria-hidden="true" />
 
   <main class="layout">
     <section class="board">
@@ -1106,6 +1111,23 @@ function initSessionData() {
   }
   session.lastActionStack = [];
   rebuildAllSplitProjections();
+}
+
+// A deliberate new run must discard every timing-derived projection before
+// initSessionData rebuilds runner state. Recovery bypasses this function and
+// continues to restore the saved current session in full.
+function clearPreviousSessionTimingState() {
+  session.acceptedLaps = [];
+  session.acceptedLapCounter = 0;
+  session.rawHardwareEvents = [];
+  session.rawEventCounter = 0;
+  session.lastActionStack = [];
+  session.doneAcknowledgements = {};
+  session.acknowledgementEvents = [];
+  session.correctionEvents = [];
+  session.correctionEventCounter = 0;
+  session.correctionOperationIds = new Set();
+  session.dataById.clear();
 }
 
 // ===== Utilities =====
@@ -2455,6 +2477,7 @@ function buildRunnerOverview(active) {
 }
 function buildLiveGate() {
   const panel=document.createElement("section"); panel.className="liveGatePanel";
+  const readiness=document.createElement("div");readiness.id="scannerReadiness";readiness.className="scannerReadiness";if(readiness.setAttribute){readiness.setAttribute("role","status");readiness.setAttribute("aria-live","polite");}panel.appendChild(readiness);updateScannerReadiness(readiness);
   const completed=completedRunnerRows(), outstanding=completed.filter(r=>{const ack=session.doneAcknowledgements[String(r.student_id)];return !ack||String(ack.lapId||"")!==String(r.lap_id||"")});
   const title=document.createElement("div");title.className="gateTitle";title.innerHTML=`<span>DONE — DIRECT OUT</span><span>${outstanding.length} awaiting</span>`; if(Object.keys(session.doneAcknowledgements||{}).length){const restore=document.createElement("button");restore.type="button";restore.className="restoreAck";restore.textContent="Restore last acknowledged";restore.addEventListener("click",restoreLastAcknowledged);title.appendChild(restore)} panel.appendChild(title);
   const queue=document.createElement("div");queue.id="doneQueue";queue.className="doneQueue";
@@ -2639,6 +2662,13 @@ function recordRfidKeyboardEvent(originalValue, capture) {
   finalizeRawHardwareEvent(event, outcome.status, outcome.reason, s.id, outcome.acceptedSplitIndex, outcome.acceptedLapId);
 }
 
+function recordIncompleteRfidKeyboardEvent(originalValue, capture, interruptionReason) {
+  const event = createRawHardwareEvent(originalValue, capture);
+  appendRawHardwareEvent(event);
+  const reason = `RFID input was incomplete because it ${interruptionReason}; no terminating Enter was received.`;
+  finalizeRawHardwareEvent(event, RFID_STATUSES.MALFORMED, reason, null, null, null);
+}
+
 function recordPassByTagId(tagId) {
   const capture = { wallTimeIso: new Date().toISOString(), perfMs: performance.now() };
   recordRfidKeyboardEvent(String(tagId), capture);
@@ -2662,6 +2692,9 @@ function startRun() {
 
   stopLiveElapsedTicker();
 
+  // Clear the preceding run before any new-session runner projections exist.
+  clearPreviousSessionTimingState();
+
   // Lock in sessionConfig at the moment Start is pressed
   sessionConfig = buildSessionConfigFromControls();
   session.lockedDebounceSeconds = sessionConfig.debounceSeconds;
@@ -2679,14 +2712,7 @@ function startRun() {
   session.endedWallTimeIso = null;
   session.endedElapsedMs = null;
   updateElapsedDisplay();
-  session.acceptedLaps = [];
-  session.acceptedLapCounter = 0;
-  session.doneAcknowledgements = {};
-  session.acknowledgementEvents = [];
   chronologicalEventLimit = CHRONOLOGICAL_EVENT_PAGE_SIZE;
-  session.correctionEvents = [];
-  session.correctionEventCounter = 0;
-  session.correctionOperationIds = new Set();
 
   btnStart.disabled = true;
   btnStop.disabled = false;
@@ -2842,6 +2868,8 @@ function exportCsv() {
 // ===== Scan input handling =====
 let scannerPartialTimer = null;
 let scannerTimedOutSinceLastEnter = false;
+let scannerBuffer = "";
+let browserWindowFocused = typeof document.hasFocus === "function" ? document.hasFocus() : true;
 
 function focusScanInput() {
   elScanInput.focus();
@@ -2855,39 +2883,65 @@ function clearScannerPartialTimer() {
 
 function armScannerPartialTimer() {
   clearScannerPartialTimer();
-  if (!elScanInput.value) return;
+  if (!scannerBuffer) return;
   scannerTimedOutSinceLastEnter = false;
   scannerPartialTimer = window.setTimeout(() => {
-    const partial = elScanInput.value;
-    clearScannerPartialTimer();
-    if (!partial) return;
-    scannerTimedOutSinceLastEnter = true;
-    elScanInput.value = "";
-    pushFeedItem(`<b>Scanner warning</b>: partial RFID input timed out.`);
-    recordRfidKeyboardEvent(partial, { wallTimeIso: new Date().toISOString(), perfMs: performance.now() });
+    auditAndClearScannerPartial("timed out");
   }, RFID_PARTIAL_TIMEOUT_MS);
 }
 
-elScanInput.addEventListener("input", () => {
-  if (elScanInput.value) armScannerPartialTimer();
-  else clearScannerPartialTimer();
-});
+function auditAndClearScannerPartial(reason) {
+  clearScannerPartialTimer();
+  const partial = scannerBuffer;
+  scannerBuffer = "";
+  if (!partial) return false;
+  scannerTimedOutSinceLastEnter = true;
+  pushFeedItem(`<b>Scanner warning</b>: partial RFID input ${escapeHtml(reason)}.`);
+  recordIncompleteRfidKeyboardEvent(partial, { wallTimeIso: new Date().toISOString(), perfMs: performance.now() }, reason);
+  return true;
+}
 
-elScanInput.addEventListener("keydown", (e) => {
+function isEditableCaptureTarget(target) {
+  if (!target || target === elScanInput) return false;
+  const tag = String(target.tagName || "").toUpperCase();
+  if (tag === "TEXTAREA" || !!target.isContentEditable) return true;
+  if (tag !== "INPUT") return false;
+  const type = String(target.type || "text").toLowerCase();
+  return ["text", "search", "email", "url", "tel", "password", "number", "date", "datetime-local", "month", "week", "time"].includes(type);
+}
+
+function scannerIsArmed() { return browserWindowFocused && document.hidden !== true; }
+
+function updateScannerReadiness(element) {
+  const el = element || document.getElementById("scannerReadiness");
+  if (!el) return;
+  const armed = scannerIsArmed();
+  el.className = `scannerReadiness ${armed ? "armed" : "lost"}`;
+  el.innerHTML = armed
+    ? `<span class="readinessIcon" aria-hidden="true">●</span><span><b>SCANNER ARMED — Browser ready for RFID input</b><small>Browser input ready; reader connection is not monitored.</small></span>`
+    : `<span class="readinessIcon" aria-hidden="true">▲</span><span><b>INPUT LOST — Return to this page</b><small>The page must be visible and the browser window focused.</small></span>`;
+}
+
+function handleScannerKeydown(e) {
+  if (!scannerIsArmed() || isEditableCaptureTarget(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key === "Enter") {
-    e.preventDefault();
+    const value = scannerBuffer;
+    if (!value) { scannerTimedOutSinceLastEnter = false; return; }
+    if (e.preventDefault) e.preventDefault();
     clearScannerPartialTimer();
-    const val = elScanInput.value;
-    elScanInput.value = "";
-    if (!val && scannerTimedOutSinceLastEnter) {
-      scannerTimedOutSinceLastEnter = false;
-      return;
-    }
+    scannerBuffer = "";
     scannerTimedOutSinceLastEnter = false;
-    if (!val) return;
-    recordPassByTagId(val);
+    recordPassByTagId(value);
+    return;
   }
-});
+  // Keyboard wedges emit printable characters. Navigation/function keys are ignored.
+  if (typeof e.key !== "string" || e.key.length !== 1) return;
+  scannerBuffer += e.key;
+  scannerTimedOutSinceLastEnter = false;
+  armScannerPartialTimer();
+}
+
+document.addEventListener("keydown", handleScannerKeydown);
 
 document.addEventListener("click", (e) => {
   // Don't steal focus when user is interacting with UI controls
@@ -2910,7 +2964,9 @@ document.addEventListener("click", (e) => {
   if (session.started) focusScanInput();
 });
 
-window.addEventListener("blur", () => elFocusWarn.classList.remove("hidden"));
+window.addEventListener("blur", () => { auditAndClearScannerPartial("was interrupted when browser focus was lost"); browserWindowFocused=false; elFocusWarn.classList.remove("hidden"); updateScannerReadiness(); });
+window.addEventListener("focus", () => { browserWindowFocused=true; elFocusWarn.classList.add("hidden"); updateScannerReadiness(); });
+document.addEventListener("visibilitychange", () => { if(document.hidden)auditAndClearScannerPartial("was interrupted when the page was hidden"); updateScannerReadiness(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && elRunnerActionPanel && !elRunnerActionPanel.classList.contains("hidden")) closeRunnerActionPanel(); });
 
 // ===== CSV roster handling =====
