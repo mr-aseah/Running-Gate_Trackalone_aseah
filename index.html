@@ -197,9 +197,9 @@ body.capture-compact #scanHint:not(.details-open) .rosterRow, body.capture-compa
 .overviewHeader { position:sticky; top:0; z-index:2; background:#fff; display:flex; justify-content:space-between; align-items:center; gap:8px; padding-bottom:8px; }
 .overviewTotals { font-size:12px; font-weight:800; color:#475569; }
 .liveGatePanel,.chronologicalPanel { min-width:0; overflow:hidden; background:#fff; border:2px solid #cbd5e1; border-radius:14px; padding:10px; display:grid; gap:9px; }
-.liveGatePanel { grid-template-rows:auto minmax(120px,.38fr) auto minmax(0,1fr); }.chronologicalPanel { grid-template-rows:auto minmax(0,1fr); }
+.liveGatePanel { grid-template-rows:52px auto minmax(100px,.38fr) auto minmax(0,1fr); }.chronologicalPanel { grid-template-rows:auto minmax(0,1fr); }
 .gateTitle { display:flex; justify-content:space-between; align-items:center; gap:8px; font-weight:1000; font-size:18px; }
-.scannerReadiness { min-height:52px; display:flex; align-items:center; gap:10px; padding:8px 12px; border:3px solid; border-radius:12px; font-size:15px; line-height:1.2; }
+.scannerReadiness { min-height:0; box-sizing:border-box; display:flex; align-items:center; gap:10px; padding:6px 12px; border:3px solid; border-radius:12px; font-size:15px; line-height:1.15; overflow:hidden; }
 .scannerReadiness.armed { border-color:#15803d; background:#f0fdf4; color:#14532d; }
 .scannerReadiness.lost { border-color:#b91c1c; background:#fef2f2; color:#7f1d1d; }
 .scannerReadiness .readinessIcon { font-size:25px; flex:none; }
@@ -2879,20 +2879,28 @@ function armScannerPartialTimer() {
   if (!scannerBuffer) return;
   scannerTimedOutSinceLastEnter = false;
   scannerPartialTimer = window.setTimeout(() => {
-    const partial = scannerBuffer;
-    clearScannerPartialTimer();
-    if (!partial) return;
-    scannerTimedOutSinceLastEnter = true;
-    scannerBuffer = "";
-    pushFeedItem(`<b>Scanner warning</b>: partial RFID input timed out.`);
-    recordRfidKeyboardEvent(partial, { wallTimeIso: new Date().toISOString(), perfMs: performance.now() });
+    auditAndClearScannerPartial("timed out");
   }, RFID_PARTIAL_TIMEOUT_MS);
+}
+
+function auditAndClearScannerPartial(reason) {
+  clearScannerPartialTimer();
+  const partial = scannerBuffer;
+  scannerBuffer = "";
+  if (!partial) return false;
+  scannerTimedOutSinceLastEnter = true;
+  pushFeedItem(`<b>Scanner warning</b>: partial RFID input ${escapeHtml(reason)}.`);
+  recordRfidKeyboardEvent(partial, { wallTimeIso: new Date().toISOString(), perfMs: performance.now() });
+  return true;
 }
 
 function isEditableCaptureTarget(target) {
   if (!target || target === elScanInput) return false;
   const tag = String(target.tagName || "").toUpperCase();
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!target.isContentEditable;
+  if (tag === "TEXTAREA" || !!target.isContentEditable) return true;
+  if (tag !== "INPUT") return false;
+  const type = String(target.type || "text").toLowerCase();
+  return ["text", "search", "email", "url", "tel", "password", "number", "date", "datetime-local", "month", "week", "time"].includes(type);
 }
 
 function scannerIsArmed() { return browserWindowFocused && document.hidden !== true; }
@@ -2910,13 +2918,13 @@ function updateScannerReadiness(element) {
 function handleScannerKeydown(e) {
   if (!scannerIsArmed() || isEditableCaptureTarget(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key === "Enter") {
+    const value = scannerBuffer;
+    if (!value) { scannerTimedOutSinceLastEnter = false; return; }
     if (e.preventDefault) e.preventDefault();
     clearScannerPartialTimer();
-    const value = scannerBuffer;
     scannerBuffer = "";
-    if (!value && scannerTimedOutSinceLastEnter) { scannerTimedOutSinceLastEnter = false; return; }
     scannerTimedOutSinceLastEnter = false;
-    if (value) recordPassByTagId(value);
+    recordPassByTagId(value);
     return;
   }
   // Keyboard wedges emit printable characters. Navigation/function keys are ignored.
@@ -2949,9 +2957,9 @@ document.addEventListener("click", (e) => {
   if (session.started) focusScanInput();
 });
 
-window.addEventListener("blur", () => { browserWindowFocused=false; scannerBuffer=""; clearScannerPartialTimer(); elFocusWarn.classList.remove("hidden"); updateScannerReadiness(); });
+window.addEventListener("blur", () => { auditAndClearScannerPartial("was interrupted when browser focus was lost"); browserWindowFocused=false; elFocusWarn.classList.remove("hidden"); updateScannerReadiness(); });
 window.addEventListener("focus", () => { browserWindowFocused=true; elFocusWarn.classList.add("hidden"); updateScannerReadiness(); });
-document.addEventListener("visibilitychange", () => { if(document.hidden){scannerBuffer="";clearScannerPartialTimer()} updateScannerReadiness(); });
+document.addEventListener("visibilitychange", () => { if(document.hidden)auditAndClearScannerPartial("was interrupted when the page was hidden"); updateScannerReadiness(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && elRunnerActionPanel && !elRunnerActionPanel.classList.contains("hidden")) closeRunnerActionPanel(); });
 
 // ===== CSV roster handling =====
